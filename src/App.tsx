@@ -218,7 +218,7 @@ const ReportContent = ({ currentTemplate, projectInfo, entries }: { currentTempl
   </div>
 );
 
-export default function App() {
+function MainApp({ onReset }: { onReset: () => void }) {
   const [entries, setEntries] = useState<Entry[]>(() => {
     const saved = localStorage.getItem('constructReport_entries');
     return saved ? JSON.parse(saved) : [];
@@ -517,20 +517,24 @@ export default function App() {
       const fileName = `Report_${projectInfo?.name || 'Site'}.pdf`;
       const file = new File([pdfBlob], fileName, { type: 'application/pdf' });
 
-      // On iOS, navigator.share with files is only supported in some contexts
-      // and can be picky about the file object.
-      if (navigator.share && navigator.canShare && navigator.canShare({ files: [file] })) {
+      // Try Web Share API first
+      if (navigator.share) {
         try {
-          await navigator.share({
+          const shareData = {
             files: [file],
             title: 'Site Visit Report',
             text: `Attached is the site visit report for ${projectInfo?.name}.`
-          });
+          };
+          
+          // Attempt to share
+          await navigator.share(shareData);
+          
           setShowPostSharePrompt(true);
           setShowPreview(false);
           return;
         } catch (shareErr) {
-          console.log("Share failed, falling back to print:", shareErr);
+          console.warn("Share failed, falling back to print:", shareErr);
+          // Fall through to print
         }
       }
 
@@ -593,27 +597,12 @@ export default function App() {
 
   const handleStartNewReport = () => {
     if (confirm("Are you sure? This will clear all current observations.")) {
-      // Clear all state
-      setEntries([]);
-      setProjectInfo(null);
-      setTempInfo({
-        name: '',
-        date: new Date().toISOString().split('T')[0],
-        author: ''
-      });
-      
       // Clear localStorage explicitly
       localStorage.removeItem('constructReport_entries');
       localStorage.removeItem('constructReport_projectInfo');
       
-      // Reset UI state
-      setShowPostSharePrompt(false);
-      setShowMenu(false);
-      setShowPreview(false);
-      setShowCapture(true);
-      
-      // Force return to setup screen
-      setIsSettingUp(true);
+      // Reset the application state completely by remounting
+      onReset();
     }
   };
 
@@ -639,7 +628,6 @@ export default function App() {
                 required
                 value={tempInfo.name}
                 onChange={(e) => setTempInfo({...tempInfo, name: e.target.value})}
-                placeholder="Project Name"
                 className="w-full bg-stone-50 border border-stone-200 rounded-xl p-4 text-sm focus:ring-2 focus:ring-clark-bright outline-none"
               />
             </div>
@@ -1098,5 +1086,19 @@ export default function App() {
         )}
       </AnimatePresence>
     </>
+  );
+}
+
+export default function App() {
+  const [key, setKey] = useState(0);
+  
+  const handleReset = () => {
+    setKey(prev => prev + 1);
+  };
+  
+  return (
+    <div key={key}>
+      <MainApp onReset={handleReset} />
+    </div>
   );
 }
