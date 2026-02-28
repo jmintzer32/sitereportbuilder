@@ -289,13 +289,21 @@ function MainApp({ onReset }: { onReset: () => void }) {
   const [manualObservation, setManualObservation] = useState('');
   const [manualAction, setManualAction] = useState('');
   const [manualTrade, setManualTrade] = useState('');
+  const [apiKey, setApiKey] = useState<string>('');
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const reportRef = useRef<HTMLDivElement>(null);
 
-  const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
+  useEffect(() => {
+    fetch('/api/config')
+      .then(res => res.json())
+      .then(data => {
+        if (data.apiKey) setApiKey(data.apiKey);
+      })
+      .catch(err => console.error("Failed to load config", err));
+  }, []);
 
   const handleCapturePhoto = () => {
     fileInputRef.current?.click();
@@ -366,6 +374,12 @@ function MainApp({ onReset }: { onReset: () => void }) {
 
       // If we have audio, use Gemini to transcribe and analyze
       if (audioBlob) {
+        if (!apiKey) {
+          throw new Error("API Key not loaded. Please refresh the page.");
+        }
+        
+        const ai = new GoogleGenAI({ apiKey });
+
         const audioBase64 = await new Promise<string>((resolve) => {
           const reader = new FileReader();
           reader.onloadend = () => resolve((reader.result as string).split(',')[1]);

@@ -1,3 +1,4 @@
+import "dotenv/config";
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import path from "path";
@@ -22,6 +23,13 @@ async function startServer() {
   // Health check
   app.get("/api/health", (req, res) => {
     res.json({ status: "ok" });
+  });
+
+  // Serve API configuration
+  app.get("/api/config", (req, res) => {
+    res.json({ 
+      apiKey: process.env.GEMINI_API_KEY || "" 
+    });
   });
 
   // Vite middleware for development
