@@ -1,0 +1,8 @@
+{
+  "name": "ConstructReport PWA",
+  "description": "A professional PWA for construction site visits, capturing photos and audio dictations to generate AI-powered field reports.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}

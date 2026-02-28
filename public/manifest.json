@@ -1,0 +1,20 @@
+{
+  "short_name": "ClarkQC",
+  "name": "Clark Site Report Builder",
+  "icons": [
+    {
+      "src": "https://picsum.photos/seed/clark/192/192",
+      "type": "image/png",
+      "sizes": "192x192"
+    },
+    {
+      "src": "https://picsum.photos/seed/clark/512/512",
+      "type": "image/png",
+      "sizes": "512x512"
+    }
+  ],
+  "start_url": ".",
+  "display": "standalone",
+  "theme_color": "#001430",
+  "background_color": "#ffffff"
+}
