@@ -9,13 +9,13 @@ import {
 import { motion, AnimatePresence } from 'motion/react';
 import jsPDF from 'jspdf';
 import html2canvas from 'html2canvas';
+import { get, set, del } from 'idb-keyval';
 
 interface Entry {
   id: string;
   images: string[];
   observation: string;
-  proposedAction: string;
-  tradeResponsible: string;
+  actionResponsibility: string;
   transcription?: string;
   audioData?: string;
   pendingAI?: boolean;
@@ -170,12 +170,8 @@ const ReportContent = ({ currentTemplate, projectInfo, entries }: { currentTempl
               </div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: '24px' }}>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                  <h4 style={{ fontSize: '10px', fontWeight: '900', textTransform: 'uppercase', letterSpacing: '0.1em', color: '#000000', margin: 0, fontFamily: '"Inter", sans-serif' }}>Proposed Action</h4>
-                  <p style={{ fontSize: '14px', fontWeight: '800', color: '#001430', margin: 0, fontFamily: '"Inter", sans-serif' }}>{entry.proposedAction}</p>
-                </div>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                  <h4 style={{ fontSize: '10px', fontWeight: '900', textTransform: 'uppercase', letterSpacing: '0.1em', color: '#000000', margin: 0, fontFamily: '"Inter", sans-serif' }}>Responsible Trade</h4>
-                  <p style={{ fontSize: '14px', fontWeight: '800', textTransform: 'uppercase', color: '#001430', margin: 0, fontFamily: '"Inter", sans-serif' }}>{entry.tradeResponsible}</p>
+                  <h4 style={{ fontSize: '10px', fontWeight: '900', textTransform: 'uppercase', letterSpacing: '0.1em', color: '#000000', margin: 0, fontFamily: '"Inter", sans-serif' }}>Action & Responsibility</h4>
+                  <p style={{ fontSize: '14px', fontWeight: '800', color: '#001430', margin: 0, fontFamily: '"Inter", sans-serif' }}>{entry.actionResponsibility}</p>
                 </div>
               </div>
             </div>
@@ -221,37 +217,54 @@ const ReportContent = ({ currentTemplate, projectInfo, entries }: { currentTempl
 );
 
 function MainApp({ onReset }: { onReset: () => void }) {
-  const [entries, setEntries] = useState<Entry[]>(() => {
-    const saved = localStorage.getItem('constructReport_entries');
-    return saved ? JSON.parse(saved) : [];
-  });
-  const [projectInfo, setProjectInfo] = useState<ProjectInfo | null>(() => {
-    const saved = localStorage.getItem('constructReport_projectInfo');
-    return saved ? JSON.parse(saved) : null;
-  });
-  const [isSettingUp, setIsSettingUp] = useState(() => {
-    const saved = localStorage.getItem('constructReport_projectInfo');
-    return saved ? false : true;
-  });
+  const [isInitializing, setIsInitializing] = useState(true);
+  const [entries, setEntries] = useState<Entry[]>([]);
+  const [projectInfo, setProjectInfo] = useState<ProjectInfo | null>(null);
+  const [isSettingUp, setIsSettingUp] = useState(true);
   
   // Temporary state for the setup form
   const [tempInfo, setTempInfo] = useState<ProjectInfo>({
-    name: projectInfo?.name || '',
-    date: projectInfo?.date || new Date().toISOString().split('T')[0],
-    author: projectInfo?.author || ''
+    name: '',
+    date: new Date().toISOString().split('T')[0],
+    author: ''
   });
 
   useEffect(() => {
-    localStorage.setItem('constructReport_entries', JSON.stringify(entries));
-  }, [entries]);
+    async function loadData() {
+      try {
+        const savedEntries = await get('constructReport_entries');
+        if (savedEntries) setEntries(savedEntries);
+
+        const savedProjectInfo = await get('constructReport_projectInfo');
+        if (savedProjectInfo) {
+          setProjectInfo(savedProjectInfo);
+          setTempInfo(savedProjectInfo);
+          setIsSettingUp(false);
+        }
+      } catch (err) {
+        console.error("Failed to load data from IndexedDB", err);
+      } finally {
+        setIsInitializing(false);
+      }
+    }
+    loadData();
+  }, []);
 
   useEffect(() => {
-    if (projectInfo) {
-      localStorage.setItem('constructReport_projectInfo', JSON.stringify(projectInfo));
-    } else {
-      localStorage.removeItem('constructReport_projectInfo');
+    if (!isInitializing) {
+      set('constructReport_entries', entries);
     }
-  }, [projectInfo]);
+  }, [entries, isInitializing]);
+
+  useEffect(() => {
+    if (!isInitializing) {
+      if (projectInfo) {
+        set('constructReport_projectInfo', projectInfo);
+      } else {
+        del('constructReport_projectInfo');
+      }
+    }
+  }, [projectInfo, isInitializing]);
 
   const [currentImages, setCurrentImages] = useState<string[]>([]);
   const [audioBlob, setAudioBlob] = useState<Blob | null>(null);
@@ -265,6 +278,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
   const [showPreview, setShowPreview] = useState(false);
   const [showPostSharePrompt, setShowPostSharePrompt] = useState(false);
   const [showMenu, setShowMenu] = useState(false);
+  const [itemToDelete, setItemToDelete] = useState<string | null>(null);
   const [deferredPrompt, setDeferredPrompt] = useState<any>(null);
 
   useEffect(() => {
@@ -289,15 +303,13 @@ function MainApp({ onReset }: { onReset: () => void }) {
 
   // Form fields for manual entry/edit
   const [manualObservation, setManualObservation] = useState('');
-  const [manualAction, setManualAction] = useState('');
-  const [manualTrade, setManualTrade] = useState('');
+  const [manualActionResponsibility, setManualActionResponsibility] = useState('');
   const [apiKey, setApiKey] = useState<string>('');
   const [liveTranscription, setLiveTranscription] = useState('');
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const galleryInputRef = useRef<HTMLInputElement>(null);
   const reportRef = useRef<HTMLDivElement>(null);
   const recognitionRef = useRef<any>(null);
 
@@ -314,22 +326,50 @@ function MainApp({ onReset }: { onReset: () => void }) {
     fileInputRef.current?.click();
   };
 
-  const handleGalleryPhoto = () => {
-    galleryInputRef.current?.click();
+  const compressImage = (file: File): Promise<string> => {
+    return new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        const img = new window.Image();
+        img.onload = () => {
+          const canvas = document.createElement('canvas');
+          let width = img.width;
+          let height = img.height;
+          
+          const MAX_WIDTH = 1024;
+          const MAX_HEIGHT = 1024;
+          
+          if (width > height) {
+            if (width > MAX_WIDTH) {
+              height *= MAX_WIDTH / width;
+              width = MAX_WIDTH;
+            }
+          } else {
+            if (height > MAX_HEIGHT) {
+              width *= MAX_HEIGHT / height;
+              height = MAX_HEIGHT;
+            }
+          }
+          
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext('2d');
+          ctx?.drawImage(img, 0, 0, width, height);
+          resolve(canvas.toDataURL('image/jpeg', 0.7));
+        };
+        img.src = event.target?.result as string;
+      };
+      reader.readAsDataURL(file);
+    });
   };
 
-  const onFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const onFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (files) {
-      Array.from(files).forEach((file: File) => {
-        const reader = new FileReader();
-        reader.onloadend = () => {
-          if (typeof reader.result === 'string') {
-            setCurrentImages(prev => [...prev, reader.result as string]);
-          }
-        };
-        reader.readAsDataURL(file);
-      });
+      const compressedImages = await Promise.all(
+        Array.from(files).map(file => compressImage(file))
+      );
+      setCurrentImages(prev => [...prev, ...compressedImages]);
     }
   };
 
@@ -444,8 +484,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
 
     try {
       let observation = manualObservation;
-      let action = manualAction;
-      let trade = manualTrade;
+      let actionResponsibility = manualActionResponsibility;
       let transcription = "";
       let pendingAI = false;
       let audioBase64Data = "";
@@ -461,8 +500,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
         if (!navigator.onLine) {
           // Offline mode
           observation = liveTranscription.trim() || "Pending network connection... Summary will be generated later.";
-          action = "Pending...";
-          trade = "Pending...";
+          actionResponsibility = "Pending...";
           transcription = liveTranscription.trim() || "Audio saved. Transcription pending network connection.";
           pendingAI = true;
         } else {
@@ -478,12 +516,12 @@ function MainApp({ onReset }: { onReset: () => void }) {
             }));
 
             const response = await ai.models.generateContent({
-              model: "gemini-2.5-flash",
+              model: "gemini-3-flash-preview",
               contents: {
                 parts: [
                   ...imageParts,
                   { inlineData: { mimeType: "audio/webm", data: audioBase64Data } },
-                  { text: "Analyze these site photos (if provided) and the accompanying audio dictation. Output a JSON object with four keys: Transcription (the exact text of what was said), Observation (a professional summary), Proposed_Action, and Trade_Responsible." },
+                  { text: "Process the accompanying audio dictation and site photos (if provided). Clean up the audio transcription to have proper grammar and professional wording, but DO NOT add any outside analysis, assumptions, or new information. Output a JSON object with three keys: Transcription (the exact raw text of what was said), Observation (the cleaned-up, grammatically correct version of the dictation), and Action_And_Responsibility (extract any proposed actions and responsible trades mentioned, combined into one clear statement, or leave blank)." },
                 ],
               },
               config: {
@@ -493,10 +531,9 @@ function MainApp({ onReset }: { onReset: () => void }) {
                   properties: {
                     Transcription: { type: Type.STRING },
                     Observation: { type: Type.STRING },
-                    Proposed_Action: { type: Type.STRING },
-                    Trade_Responsible: { type: Type.STRING },
+                    Action_And_Responsibility: { type: Type.STRING },
                   },
-                  required: ["Transcription", "Observation", "Proposed_Action", "Trade_Responsible"],
+                  required: ["Transcription", "Observation", "Action_And_Responsibility"],
                 },
               },
             });
@@ -504,16 +541,14 @@ function MainApp({ onReset }: { onReset: () => void }) {
             if (response.text) {
               const data = JSON.parse(response.text);
               observation = data.Observation;
-              action = data.Proposed_Action;
-              trade = data.Trade_Responsible;
+              actionResponsibility = data.Action_And_Responsibility;
               transcription = data.Transcription;
             }
           } catch (apiErr) {
             console.error("API Error during entry creation:", apiErr);
             // Fallback to pending if API fails (e.g., flaky connection)
             observation = liveTranscription.trim() || "API Error. Summary will be generated later.";
-            action = "Pending...";
-            trade = "Pending...";
+            actionResponsibility = "Pending...";
             transcription = liveTranscription.trim() || "Audio saved. Transcription pending retry.";
             pendingAI = true;
           }
@@ -524,8 +559,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
         id: editingId || Date.now().toString(),
         images: currentImages,
         observation: observation || manualObservation,
-        proposedAction: action || manualAction,
-        tradeResponsible: trade || manualTrade,
+        actionResponsibility: actionResponsibility || manualActionResponsibility,
         transcription: transcription,
         audioData: audioBase64Data || undefined,
         pendingAI: pendingAI
@@ -550,8 +584,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
     setCurrentImages([]);
     setAudioBlob(null);
     setManualObservation('');
-    setManualAction('');
-    setManualTrade('');
+    setManualActionResponsibility('');
     setEditingId(null);
     setError(null);
   };
@@ -560,13 +593,13 @@ function MainApp({ onReset }: { onReset: () => void }) {
     setEditingId(entry.id);
     setCurrentImages(entry.images);
     setManualObservation(entry.observation);
-    setManualAction(entry.proposedAction);
-    setManualTrade(entry.tradeResponsible);
+    setManualActionResponsibility(entry.actionResponsibility);
     setShowCapture(true);
   };
 
   const handleDelete = (id: string) => {
     setEntries(entries.filter(e => e.id !== id));
+    setItemToDelete(null);
   };
 
   const processPendingEntries = async (): Promise<boolean> => {
@@ -596,12 +629,12 @@ function MainApp({ onReset }: { onReset: () => void }) {
         }));
 
         const response = await ai.models.generateContent({
-          model: "gemini-2.5-flash",
+          model: "gemini-3-flash-preview",
           contents: {
             parts: [
               ...imageParts,
               { inlineData: { mimeType: "audio/webm", data: entry.audioData! } },
-              { text: "Analyze these site photos (if provided) and the accompanying audio dictation. Output a JSON object with four keys: Transcription (the exact text of what was said), Observation (a professional summary), Proposed_Action, and Trade_Responsible." },
+              { text: "Process the accompanying audio dictation and site photos (if provided). Clean up the audio transcription to have proper grammar and professional wording, but DO NOT add any outside analysis, assumptions, or new information. Output a JSON object with three keys: Transcription (the exact raw text of what was said), Observation (the cleaned-up, grammatically correct version of the dictation), and Action_And_Responsibility (extract any proposed actions and responsible trades mentioned, combined into one clear statement, or leave blank)." },
             ],
           },
           config: {
@@ -611,10 +644,9 @@ function MainApp({ onReset }: { onReset: () => void }) {
               properties: {
                 Transcription: { type: Type.STRING },
                 Observation: { type: Type.STRING },
-                Proposed_Action: { type: Type.STRING },
-                Trade_Responsible: { type: Type.STRING },
+                Action_And_Responsibility: { type: Type.STRING },
               },
-              required: ["Transcription", "Observation", "Proposed_Action", "Trade_Responsible"],
+              required: ["Transcription", "Observation", "Action_And_Responsibility"],
             },
           },
         });
@@ -626,8 +658,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
               ? { 
                   ...e, 
                   observation: data.Observation, 
-                  proposedAction: data.Proposed_Action, 
-                  tradeResponsible: data.Trade_Responsible, 
+                  actionResponsibility: data.Action_And_Responsibility, 
                   transcription: data.Transcription,
                   pendingAI: false 
                 } 
@@ -791,11 +822,11 @@ function MainApp({ onReset }: { onReset: () => void }) {
     }
   };
 
-  const handleStartNewReport = () => {
+  const handleStartNewReport = async () => {
     if (confirm("Are you sure? This will clear all current observations.")) {
-      // Clear localStorage explicitly
-      localStorage.removeItem('constructReport_entries');
-      localStorage.removeItem('constructReport_projectInfo');
+      // Clear IndexedDB explicitly
+      await del('constructReport_entries');
+      await del('constructReport_projectInfo');
       
       // Reset the application state completely by remounting
       onReset();
@@ -803,6 +834,14 @@ function MainApp({ onReset }: { onReset: () => void }) {
   };
 
   const currentTemplate = TEMPLATES.find(t => t.id === selectedTemplate)!;
+
+  if (isInitializing) {
+    return (
+      <div className="min-h-screen bg-clark-navy flex items-center justify-center">
+        <Loader2 className="w-8 h-8 text-white animate-spin" />
+      </div>
+    );
+  }
 
   if (isSettingUp) {
     return (
@@ -1045,17 +1084,17 @@ function MainApp({ onReset }: { onReset: () => void }) {
                     {entry.pendingAI && <span className="inline-flex items-center gap-1 bg-amber-100 text-amber-800 text-[10px] px-2 py-0.5 rounded-full mr-2 uppercase tracking-tight"><AlertCircle className="w-3 h-3" /> Pending AI</span>}
                     {entry.observation}
                   </p>
-                  <p className="text-[10px] text-stone-400 uppercase font-bold tracking-tight">{entry.tradeResponsible} • {entry.proposedAction}</p>
-                  {entry.transcription && (
+                  <p className="text-[10px] text-stone-400 uppercase font-bold tracking-tight">{entry.actionResponsibility}</p>
+                  {entry.transcription && entry.pendingAI && (
                     <div className="mt-2 p-2 bg-stone-50 rounded text-[10px] text-stone-500 italic border-l-2 border-clark-bright">
                       "{entry.transcription}"
                     </div>
                   )}
                 </div>
-                <div className="absolute top-4 right-4 flex flex-col gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                <div className="absolute top-4 right-4 flex flex-col gap-2 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity">
                   <button 
-                    onClick={(e) => { e.stopPropagation(); handleDelete(entry.id); }} 
-                    className="p-1.5 bg-stone-100 rounded-lg text-stone-600 hover:bg-red-100 hover:text-red-700"
+                    onClick={(e) => { e.stopPropagation(); setItemToDelete(entry.id); }} 
+                    className="p-1.5 bg-stone-100 rounded-lg text-stone-600 hover:bg-red-100 hover:text-red-700 shadow-sm border border-stone-200"
                   >
                     <Trash2 className="w-4 h-4" />
                   </button>
@@ -1084,24 +1123,15 @@ function MainApp({ onReset }: { onReset: () => void }) {
 
                 {/* Capture Controls */}
                 <div className="space-y-4">
-                  <div className="grid grid-cols-3 gap-3">
+                  <div className="grid grid-cols-2 gap-3">
                     <button
                       onClick={handleCapturePhoto}
                       className="aspect-square rounded-2xl border-2 border-dashed border-stone-300 bg-stone-50 flex flex-col items-center justify-center gap-2 transition-all hover:border-clark-bright hover:bg-clark-bright/5"
                     >
                       <Camera className="w-6 h-6 text-stone-400" />
-                      <span className="text-[10px] font-bold uppercase text-stone-500 text-center leading-tight">Camera</span>
+                      <span className="text-[10px] font-bold uppercase text-stone-500 text-center leading-tight">Camera / Gallery</span>
                     </button>
-                    <input type="file" accept="image/*" capture="environment" multiple ref={fileInputRef} onChange={onFileChange} className="hidden" />
-
-                    <button
-                      onClick={handleGalleryPhoto}
-                      className="aspect-square rounded-2xl border-2 border-dashed border-stone-300 bg-stone-50 flex flex-col items-center justify-center gap-2 transition-all hover:border-clark-bright hover:bg-clark-bright/5"
-                    >
-                      <Image className="w-6 h-6 text-stone-400" />
-                      <span className="text-[10px] font-bold uppercase text-stone-500 text-center leading-tight">Gallery</span>
-                    </button>
-                    <input type="file" accept="image/*" multiple ref={galleryInputRef} onChange={onFileChange} className="hidden" />
+                    <input type="file" accept="image/*" multiple ref={fileInputRef} onChange={onFileChange} className="hidden" />
 
                     <button
                       onClick={isRecording ? stopRecording : startRecording}
@@ -1115,7 +1145,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
                         <Mic className={`w-6 h-6 ${audioBlob ? 'text-clark-bright' : 'text-stone-400'}`} />
                       )}
                       <span className="text-[10px] font-bold uppercase text-stone-500 text-center leading-tight px-1">
-                        {isRecording ? 'Recording...' : audioBlob ? 'Audio Ready' : 'Dictate'}
+                        {isRecording ? 'Recording...' : audioBlob ? 'Audio Ready' : 'Dictate to AI'}
                       </span>
                     </button>
                   </div>
@@ -1149,25 +1179,14 @@ function MainApp({ onReset }: { onReset: () => void }) {
                       className="w-full bg-stone-50 border border-stone-200 rounded-xl p-3 text-sm focus:ring-2 focus:ring-clark-bright outline-none min-h-[80px]"
                     />
                   </div>
-                  <div className="grid grid-cols-2 gap-4">
-                    <div className="space-y-1">
-                      <label className="text-[10px] uppercase tracking-widest font-bold text-stone-400">Action</label>
-                      <input 
-                        value={manualAction}
-                        onChange={(e) => setManualAction(e.target.value)}
-                        placeholder="Required fix..."
-                        className="w-full bg-stone-50 border border-stone-200 rounded-xl p-3 text-sm focus:ring-2 focus:ring-clark-bright outline-none"
-                      />
-                    </div>
-                    <div className="space-y-1">
-                      <label className="text-[10px] uppercase tracking-widest font-bold text-stone-400">Trade</label>
-                      <input 
-                        value={manualTrade}
-                        onChange={(e) => setManualTrade(e.target.value)}
-                        placeholder="Responsible..."
-                        className="w-full bg-stone-50 border border-stone-200 rounded-xl p-3 text-sm focus:ring-2 focus:ring-clark-bright outline-none"
-                      />
-                    </div>
+                  <div className="space-y-1">
+                    <label className="text-[10px] uppercase tracking-widest font-bold text-stone-400">Action & Responsibility</label>
+                    <input 
+                      value={manualActionResponsibility}
+                      onChange={(e) => setManualActionResponsibility(e.target.value)}
+                      placeholder="Required fix and responsible trade..."
+                      className="w-full bg-stone-50 border border-stone-200 rounded-xl p-3 text-sm focus:ring-2 focus:ring-clark-bright outline-none"
+                    />
                   </div>
                 </div>
 
@@ -1265,6 +1284,39 @@ function MainApp({ onReset }: { onReset: () => void }) {
 
       {/* Post-Share Prompt Modal */}
       <AnimatePresence>
+        {itemToDelete && (
+          <div className="fixed inset-0 z-[200] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 no-print">
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.9 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.9 }}
+              className="bg-white w-full max-w-sm rounded-3xl overflow-hidden flex flex-col p-6 text-center space-y-6"
+            >
+              <div className="w-16 h-16 bg-red-100 text-red-600 rounded-full flex items-center justify-center mx-auto">
+                <Trash2 className="w-8 h-8" />
+              </div>
+              <div>
+                <h3 className="text-xl font-black text-clark-navy mb-2">Delete Item?</h3>
+                <p className="text-sm text-stone-500 font-medium">Are you sure you want to delete this item? This action cannot be undone.</p>
+              </div>
+              <div className="flex flex-col gap-3">
+                <button 
+                  onClick={() => handleDelete(itemToDelete)}
+                  className="w-full bg-red-600 text-white py-3 rounded-xl font-bold active:scale-95 transition-all"
+                >
+                  Yes, Delete
+                </button>
+                <button 
+                  onClick={() => setItemToDelete(null)}
+                  className="w-full bg-stone-100 text-stone-700 py-3 rounded-xl font-bold active:scale-95 transition-all"
+                >
+                  Cancel
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+
         {showPostSharePrompt && (
           <div className="fixed inset-0 z-[200] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 no-print">
             <motion.div 
