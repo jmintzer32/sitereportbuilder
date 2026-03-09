@@ -28,7 +28,7 @@ async function startServer() {
   // Serve API configuration
   app.get("/api/config", (req, res) => {
     res.json({ 
-      apiKey: process.env.GEMINI_API_KEY || "" 
+      apiKey: process.env.API_KEY || process.env.GEMINI_API_KEY || "" 
     });
   });
 

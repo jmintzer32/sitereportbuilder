@@ -337,8 +337,46 @@ function MainApp({ onReset }: { onReset: () => void }) {
     setCurrentImages(prev => prev.filter((_, i) => i !== index));
   };
 
+  const playAudioFeedback = (type: 'start' | 'stop') => {
+    try {
+      const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioContext) return;
+      const ctx = new AudioContext();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      
+      if (type === 'start') {
+        // A pleasant ascending double beep
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(440, ctx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(880, ctx.currentTime + 0.1);
+        gain.gain.setValueAtTime(0, ctx.currentTime);
+        gain.gain.linearRampToValueAtTime(0.1, ctx.currentTime + 0.05);
+        gain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.15);
+        osc.start(ctx.currentTime);
+        osc.stop(ctx.currentTime + 0.15);
+      } else {
+        // A pleasant descending double beep
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(880, ctx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(440, ctx.currentTime + 0.1);
+        gain.gain.setValueAtTime(0, ctx.currentTime);
+        gain.gain.linearRampToValueAtTime(0.1, ctx.currentTime + 0.05);
+        gain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.15);
+        osc.start(ctx.currentTime);
+        osc.stop(ctx.currentTime + 0.15);
+      }
+    } catch (e) {
+      console.error("Audio feedback failed", e);
+    }
+  };
+
   const startRecording = async () => {
     try {
+      playAudioFeedback('start');
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const mediaRecorder = new MediaRecorder(stream);
       mediaRecorderRef.current = mediaRecorder;
@@ -382,6 +420,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
 
   const stopRecording = () => {
     if (mediaRecorderRef.current && isRecording) {
+      playAudioFeedback('stop');
       mediaRecorderRef.current.stop();
       setIsRecording(false);
       mediaRecorderRef.current.stream.getTracks().forEach(track => track.stop());
