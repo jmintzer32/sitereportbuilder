@@ -4,7 +4,7 @@ import {
   Camera, Mic, Square, Send, Loader2, CheckCircle2, 
   AlertCircle, HardHat, FileText, Settings, Download, 
   Layout, ShieldAlert, ClipboardList, Eye, Trash2, Edit3, Plus, X, Share2, Mail,
-  MoreVertical, Smartphone
+  MoreVertical, Smartphone, Image
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import jsPDF from 'jspdf';
@@ -17,6 +17,8 @@ interface Entry {
   proposedAction: string;
   tradeResponsible: string;
   transcription?: string;
+  audioData?: string;
+  pendingAI?: boolean;
 }
 
 interface ProjectInfo {
@@ -290,11 +292,14 @@ function MainApp({ onReset }: { onReset: () => void }) {
   const [manualAction, setManualAction] = useState('');
   const [manualTrade, setManualTrade] = useState('');
   const [apiKey, setApiKey] = useState<string>('');
+  const [liveTranscription, setLiveTranscription] = useState('');
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const galleryInputRef = useRef<HTMLInputElement>(null);
   const reportRef = useRef<HTMLDivElement>(null);
+  const recognitionRef = useRef<any>(null);
 
   useEffect(() => {
     fetch('/api/config')
@@ -307,6 +312,10 @@ function MainApp({ onReset }: { onReset: () => void }) {
 
   const handleCapturePhoto = () => {
     fileInputRef.current?.click();
+  };
+
+  const handleGalleryPhoto = () => {
+    galleryInputRef.current?.click();
   };
 
   const onFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -344,6 +353,28 @@ function MainApp({ onReset }: { onReset: () => void }) {
       mediaRecorder.start();
       setIsRecording(true);
       setError(null);
+      setLiveTranscription('');
+
+      // Start Web Speech API as fallback
+      const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+      if (SpeechRecognition) {
+        const recognition = new SpeechRecognition();
+        recognition.continuous = true;
+        recognition.interimResults = true;
+        recognition.onresult = (event: any) => {
+          let finalTranscript = '';
+          for (let i = event.resultIndex; i < event.results.length; ++i) {
+            if (event.results[i].isFinal) {
+              finalTranscript += event.results[i][0].transcript;
+            }
+          }
+          if (finalTranscript) {
+            setLiveTranscription(prev => prev + ' ' + finalTranscript);
+          }
+        };
+        recognition.start();
+        recognitionRef.current = recognition;
+      }
     } catch (err) {
       setError("Microphone access denied.");
     }
@@ -354,6 +385,12 @@ function MainApp({ onReset }: { onReset: () => void }) {
       mediaRecorderRef.current.stop();
       setIsRecording(false);
       mediaRecorderRef.current.stream.getTracks().forEach(track => track.stop());
+    }
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+      } catch (e) {}
+      recognitionRef.current = null;
     }
   };
 
@@ -371,55 +408,76 @@ function MainApp({ onReset }: { onReset: () => void }) {
       let action = manualAction;
       let trade = manualTrade;
       let transcription = "";
+      let pendingAI = false;
+      let audioBase64Data = "";
 
-      // If we have audio, use Gemini to transcribe and analyze
+      // If we have audio, try to use Gemini to transcribe and analyze
       if (audioBlob) {
-        if (!apiKey) {
-          throw new Error("API Key not loaded. Please refresh the page.");
-        }
-        
-        const ai = new GoogleGenAI({ apiKey });
-
-        const audioBase64 = await new Promise<string>((resolve) => {
+        audioBase64Data = await new Promise<string>((resolve) => {
           const reader = new FileReader();
           reader.onloadend = () => resolve((reader.result as string).split(',')[1]);
           reader.readAsDataURL(audioBlob);
         });
 
-        const imageParts = currentImages.map(img => ({
-          inlineData: { mimeType: "image/jpeg", data: img.split(',')[1] }
-        }));
+        if (!navigator.onLine) {
+          // Offline mode
+          observation = liveTranscription.trim() || "Pending network connection... Summary will be generated later.";
+          action = "Pending...";
+          trade = "Pending...";
+          transcription = liveTranscription.trim() || "Audio saved. Transcription pending network connection.";
+          pendingAI = true;
+        } else {
+          try {
+            if (!apiKey) {
+              throw new Error("API Key not loaded. Please refresh the page.");
+            }
+            
+            const ai = new GoogleGenAI({ apiKey });
 
-        const response = await ai.models.generateContent({
-          model: "gemini-2.5-flash",
-          contents: {
-            parts: [
-              ...imageParts,
-              { inlineData: { mimeType: "audio/webm", data: audioBase64 } },
-              { text: "Analyze these site photos (if provided) and the accompanying audio dictation. Output a JSON object with four keys: Transcription (the exact text of what was said), Observation (a professional summary), Proposed_Action, and Trade_Responsible." },
-            ],
-          },
-          config: {
-            responseMimeType: "application/json",
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                Transcription: { type: Type.STRING },
-                Observation: { type: Type.STRING },
-                Proposed_Action: { type: Type.STRING },
-                Trade_Responsible: { type: Type.STRING },
+            const imageParts = currentImages.map(img => ({
+              inlineData: { mimeType: "image/jpeg", data: img.split(',')[1] }
+            }));
+
+            const response = await ai.models.generateContent({
+              model: "gemini-2.5-flash",
+              contents: {
+                parts: [
+                  ...imageParts,
+                  { inlineData: { mimeType: "audio/webm", data: audioBase64Data } },
+                  { text: "Analyze these site photos (if provided) and the accompanying audio dictation. Output a JSON object with four keys: Transcription (the exact text of what was said), Observation (a professional summary), Proposed_Action, and Trade_Responsible." },
+                ],
               },
-              required: ["Transcription", "Observation", "Proposed_Action", "Trade_Responsible"],
-            },
-          },
-        });
+              config: {
+                responseMimeType: "application/json",
+                responseSchema: {
+                  type: Type.OBJECT,
+                  properties: {
+                    Transcription: { type: Type.STRING },
+                    Observation: { type: Type.STRING },
+                    Proposed_Action: { type: Type.STRING },
+                    Trade_Responsible: { type: Type.STRING },
+                  },
+                  required: ["Transcription", "Observation", "Proposed_Action", "Trade_Responsible"],
+                },
+              },
+            });
 
-        if (response.text) {
-          const data = JSON.parse(response.text);
-          observation = data.Observation;
-          action = data.Proposed_Action;
-          trade = data.Trade_Responsible;
-          transcription = data.Transcription;
+            if (response.text) {
+              const data = JSON.parse(response.text);
+              observation = data.Observation;
+              action = data.Proposed_Action;
+              trade = data.Trade_Responsible;
+              transcription = data.Transcription;
+            }
+          } catch (apiErr) {
+            console.error("API Error during entry creation:", apiErr);
+            // Fallback to pending if API fails (e.g., flaky connection)
+            observation = liveTranscription.trim() || "API Error. Summary will be generated later.";
+            action = "Pending...";
+            trade = "Pending...";
+            transcription = liveTranscription.trim() || "Audio saved. Transcription pending retry.";
+            pendingAI = true;
+          }
         }
       }
 
@@ -429,7 +487,9 @@ function MainApp({ onReset }: { onReset: () => void }) {
         observation: observation || manualObservation,
         proposedAction: action || manualAction,
         tradeResponsible: trade || manualTrade,
-        transcription: transcription
+        transcription: transcription,
+        audioData: audioBase64Data || undefined,
+        pendingAI: pendingAI
       };
 
       if (editingId) {
@@ -468,6 +528,83 @@ function MainApp({ onReset }: { onReset: () => void }) {
 
   const handleDelete = (id: string) => {
     setEntries(entries.filter(e => e.id !== id));
+  };
+
+  const processPendingEntries = async (): Promise<boolean> => {
+    const pendingEntries = entries.filter(e => e.pendingAI && e.audioData);
+    if (pendingEntries.length === 0) return true;
+
+    if (!navigator.onLine) {
+      // If offline, just return true to allow PDF generation with placeholders
+      return true;
+    }
+
+    if (!apiKey) {
+      alert("API Key not loaded. The report will be generated with placeholders.");
+      return true;
+    }
+
+    setIsExporting(true);
+    let updatedEntries = [...entries];
+    const ai = new GoogleGenAI({ apiKey });
+
+    try {
+      for (let i = 0; i < pendingEntries.length; i++) {
+        const entry = pendingEntries[i];
+        
+        const imageParts = entry.images.map(img => ({
+          inlineData: { mimeType: "image/jpeg", data: img.split(',')[1] }
+        }));
+
+        const response = await ai.models.generateContent({
+          model: "gemini-2.5-flash",
+          contents: {
+            parts: [
+              ...imageParts,
+              { inlineData: { mimeType: "audio/webm", data: entry.audioData! } },
+              { text: "Analyze these site photos (if provided) and the accompanying audio dictation. Output a JSON object with four keys: Transcription (the exact text of what was said), Observation (a professional summary), Proposed_Action, and Trade_Responsible." },
+            ],
+          },
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                Transcription: { type: Type.STRING },
+                Observation: { type: Type.STRING },
+                Proposed_Action: { type: Type.STRING },
+                Trade_Responsible: { type: Type.STRING },
+              },
+              required: ["Transcription", "Observation", "Proposed_Action", "Trade_Responsible"],
+            },
+          },
+        });
+
+        if (response.text) {
+          const data = JSON.parse(response.text);
+          updatedEntries = updatedEntries.map(e => 
+            e.id === entry.id 
+              ? { 
+                  ...e, 
+                  observation: data.Observation, 
+                  proposedAction: data.Proposed_Action, 
+                  tradeResponsible: data.Trade_Responsible, 
+                  transcription: data.Transcription,
+                  pendingAI: false 
+                } 
+              : e
+          );
+        }
+      }
+      return true;
+    } catch (err) {
+      console.error("Failed to process pending entries:", err);
+      alert("Failed to process some pending AI summaries (e.g., quota exceeded). The report will be generated with placeholders.");
+      return true;
+    } finally {
+      setEntries(updatedEntries);
+      setIsExporting(false);
+    }
   };
 
   const generatePDF = async () => {
@@ -522,6 +659,9 @@ function MainApp({ onReset }: { onReset: () => void }) {
   };
 
   const handleShare = async () => {
+    const processed = await processPendingEntries();
+    if (!processed) return;
+
     setIsExporting(true);
     try {
       const pdf = await generatePDF();
@@ -575,6 +715,9 @@ function MainApp({ onReset }: { onReset: () => void }) {
   };
 
   const handleDownload = async () => {
+    const processed = await processPendingEntries();
+    if (!processed) return;
+
     setIsExporting(true);
     try {
       const pdf = await generatePDF();
@@ -720,10 +863,15 @@ function MainApp({ onReset }: { onReset: () => void }) {
                     >
                       <div className="p-2 space-y-1">
                         <button
-                          onClick={() => { setShowPreview(true); setShowMenu(false); }}
-                          className="w-full flex items-center gap-3 px-4 py-3 text-sm font-bold hover:bg-stone-50 rounded-xl transition-colors"
+                          onClick={async () => { 
+                            setShowMenu(false);
+                            const processed = await processPendingEntries();
+                            if (processed) setShowPreview(true);
+                          }}
+                          disabled={isExporting}
+                          className="w-full flex items-center gap-3 px-4 py-3 text-sm font-bold hover:bg-stone-50 rounded-xl transition-colors disabled:opacity-50"
                         >
-                          <Eye className="w-4 h-4 text-clark-navy" />
+                          {isExporting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Eye className="w-4 h-4 text-clark-navy" />}
                           Preview Report
                         </button>
                         <button
@@ -854,7 +1002,10 @@ function MainApp({ onReset }: { onReset: () => void }) {
                   )}
                 </div>
                 <div className="flex-1 space-y-1 pr-8">
-                  <p className="text-sm font-bold text-clark-navy line-clamp-2">{entry.observation}</p>
+                  <p className="text-sm font-bold text-clark-navy line-clamp-2">
+                    {entry.pendingAI && <span className="inline-flex items-center gap-1 bg-amber-100 text-amber-800 text-[10px] px-2 py-0.5 rounded-full mr-2 uppercase tracking-tight"><AlertCircle className="w-3 h-3" /> Pending AI</span>}
+                    {entry.observation}
+                  </p>
                   <p className="text-[10px] text-stone-400 uppercase font-bold tracking-tight">{entry.tradeResponsible} • {entry.proposedAction}</p>
                   {entry.transcription && (
                     <div className="mt-2 p-2 bg-stone-50 rounded text-[10px] text-stone-500 italic border-l-2 border-clark-bright">
@@ -894,19 +1045,28 @@ function MainApp({ onReset }: { onReset: () => void }) {
 
                 {/* Capture Controls */}
                 <div className="space-y-4">
-                  <div className="grid grid-cols-2 gap-4">
+                  <div className="grid grid-cols-3 gap-3">
                     <button
                       onClick={handleCapturePhoto}
-                      className="aspect-video rounded-2xl border-2 border-dashed border-stone-300 bg-stone-50 flex flex-col items-center justify-center gap-2 transition-all hover:border-clark-bright hover:bg-clark-bright/5"
+                      className="aspect-square rounded-2xl border-2 border-dashed border-stone-300 bg-stone-50 flex flex-col items-center justify-center gap-2 transition-all hover:border-clark-bright hover:bg-clark-bright/5"
                     >
                       <Camera className="w-6 h-6 text-stone-400" />
-                      <span className="text-[10px] font-bold uppercase text-stone-500">Add Photo</span>
+                      <span className="text-[10px] font-bold uppercase text-stone-500 text-center leading-tight">Camera</span>
                     </button>
                     <input type="file" accept="image/*" capture="environment" multiple ref={fileInputRef} onChange={onFileChange} className="hidden" />
 
                     <button
+                      onClick={handleGalleryPhoto}
+                      className="aspect-square rounded-2xl border-2 border-dashed border-stone-300 bg-stone-50 flex flex-col items-center justify-center gap-2 transition-all hover:border-clark-bright hover:bg-clark-bright/5"
+                    >
+                      <Image className="w-6 h-6 text-stone-400" />
+                      <span className="text-[10px] font-bold uppercase text-stone-500 text-center leading-tight">Gallery</span>
+                    </button>
+                    <input type="file" accept="image/*" multiple ref={galleryInputRef} onChange={onFileChange} className="hidden" />
+
+                    <button
                       onClick={isRecording ? stopRecording : startRecording}
-                      className={`aspect-video rounded-2xl border-2 border-dashed flex flex-col items-center justify-center gap-2 transition-all ${
+                      className={`aspect-square rounded-2xl border-2 border-dashed flex flex-col items-center justify-center gap-2 transition-all ${
                         audioBlob ? 'border-clark-bright bg-clark-bright/5' : 'border-stone-300 bg-stone-50'
                       } ${isRecording ? 'animate-pulse border-red-500 bg-red-50' : ''}`}
                     >
@@ -915,8 +1075,8 @@ function MainApp({ onReset }: { onReset: () => void }) {
                       ) : (
                         <Mic className={`w-6 h-6 ${audioBlob ? 'text-clark-bright' : 'text-stone-400'}`} />
                       )}
-                      <span className="text-[10px] font-bold uppercase text-stone-500">
-                        {isRecording ? 'Recording...' : audioBlob ? 'Audio Ready' : 'Audio Dictation'}
+                      <span className="text-[10px] font-bold uppercase text-stone-500 text-center leading-tight px-1">
+                        {isRecording ? 'Recording...' : audioBlob ? 'Audio Ready' : 'Dictate'}
                       </span>
                     </button>
                   </div>
@@ -1096,6 +1256,18 @@ function MainApp({ onReset }: { onReset: () => void }) {
                 </button>
               </div>
             </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+      {/* Loading Overlay */}
+      <AnimatePresence>
+        {isExporting && (
+          <div className="fixed inset-0 z-[300] bg-black/60 backdrop-blur-sm flex flex-col items-center justify-center p-4 text-white no-print">
+            <Loader2 className="w-12 h-12 animate-spin mb-4" />
+            <h2 className="text-xl font-bold">Processing...</h2>
+            <p className="text-sm opacity-80 mt-2 text-center max-w-xs">
+              Generating AI summaries and preparing your report. This may take a moment.
+            </p>
           </div>
         )}
       </AnimatePresence>
