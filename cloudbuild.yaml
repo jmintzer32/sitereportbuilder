@@ -22,7 +22,7 @@ steps:
       - 'managed'
       - '--allow-unauthenticated'
       - '--set-env-vars'
-      - 'NODE_ENV=production,GEMINI_API_KEY=YOUR_API_KEY_HERE'
+      - 'NODE_ENV=production'
 
 images:
   - 'gcr.io/$PROJECT_ID/clark-qc-builder'
