@@ -473,6 +473,18 @@ function MainApp({ onReset }: { onReset: () => void }) {
     }
   };
 
+  const isLowConnection = () => {
+    if (!navigator.onLine) return true;
+    const conn = (navigator as any).connection || (navigator as any).mozConnection || (navigator as any).webkitConnection;
+    if (conn && conn.effectiveType) {
+      // Treat 2G and 3G as low service areas
+      if (['slow-2g', '2g', '3g'].includes(conn.effectiveType)) {
+        return true;
+      }
+    }
+    return false;
+  };
+
   const handleAddOrUpdateEntry = async () => {
     if (currentImages.length === 0 && !editingId) {
       setError("Please capture at least one photo.");
@@ -497,8 +509,8 @@ function MainApp({ onReset }: { onReset: () => void }) {
           reader.readAsDataURL(audioBlob);
         });
 
-        if (!navigator.onLine) {
-          // Offline mode
+        if (isLowConnection()) {
+          // Offline or Low Service mode
           observation = liveTranscription.trim() || "Pending network connection... Summary will be generated later.";
           actionResponsibility = "Pending...";
           transcription = liveTranscription.trim() || "Audio saved. Transcription pending network connection.";
@@ -515,7 +527,11 @@ function MainApp({ onReset }: { onReset: () => void }) {
               inlineData: { mimeType: "image/jpeg", data: img.split(',')[1] }
             }));
 
-            const response = await ai.models.generateContent({
+            const timeoutPromise = new Promise<never>((_, reject) => 
+              setTimeout(() => reject(new Error("API Timeout - Low Service Area")), 15000)
+            );
+
+            const apiCall = ai.models.generateContent({
               model: "gemini-3-flash-preview",
               contents: {
                 parts: [
@@ -537,6 +553,8 @@ function MainApp({ onReset }: { onReset: () => void }) {
                 },
               },
             });
+
+            const response = await Promise.race([apiCall, timeoutPromise]);
 
             if (response.text) {
               const data = JSON.parse(response.text);
@@ -606,8 +624,8 @@ function MainApp({ onReset }: { onReset: () => void }) {
     const pendingEntries = entries.filter(e => e.pendingAI && e.audioData);
     if (pendingEntries.length === 0) return true;
 
-    if (!navigator.onLine) {
-      // If offline, just return true to allow PDF generation with placeholders
+    if (isLowConnection()) {
+      // If offline or low service, just return true to allow PDF generation with placeholders
       return true;
     }
 
@@ -628,7 +646,11 @@ function MainApp({ onReset }: { onReset: () => void }) {
           inlineData: { mimeType: "image/jpeg", data: img.split(',')[1] }
         }));
 
-        const response = await ai.models.generateContent({
+        const timeoutPromise = new Promise<never>((_, reject) => 
+          setTimeout(() => reject(new Error("API Timeout - Low Service Area")), 30000)
+        );
+
+        const apiCall = ai.models.generateContent({
           model: "gemini-3-flash-preview",
           contents: {
             parts: [
@@ -650,6 +672,8 @@ function MainApp({ onReset }: { onReset: () => void }) {
             },
           },
         });
+
+        const response = await Promise.race([apiCall, timeoutPromise]);
 
         if (response.text) {
           const data = JSON.parse(response.text);
@@ -1135,20 +1159,42 @@ function MainApp({ onReset }: { onReset: () => void }) {
 
                     <button
                       onClick={isRecording ? stopRecording : startRecording}
-                      className={`aspect-square rounded-2xl border-2 border-dashed flex flex-col items-center justify-center gap-2 transition-all ${
-                        audioBlob ? 'border-clark-bright bg-clark-bright/5' : 'border-stone-300 bg-stone-50'
-                      } ${isRecording ? 'animate-pulse border-red-500 bg-red-50' : ''}`}
+                      className={`aspect-square rounded-2xl border-2 flex flex-col items-center justify-center gap-2 transition-all ${
+                        isRecording 
+                          ? 'border-red-500 bg-red-500 text-white shadow-[0_0_15px_rgba(239,68,68,0.5)] animate-pulse' 
+                          : audioBlob 
+                            ? 'border-clark-bright bg-clark-bright/5 border-dashed' 
+                            : 'border-stone-300 bg-stone-50 border-dashed hover:border-clark-bright hover:bg-clark-bright/5'
+                      }`}
                     >
                       {isRecording ? (
-                        <Square className="w-6 h-6 text-red-500" />
+                        <Square className="w-8 h-8 text-white fill-white" />
                       ) : (
                         <Mic className={`w-6 h-6 ${audioBlob ? 'text-clark-bright' : 'text-stone-400'}`} />
                       )}
-                      <span className="text-[10px] font-bold uppercase text-stone-500 text-center leading-tight px-1">
-                        {isRecording ? 'Recording...' : audioBlob ? 'Audio Ready' : 'Dictate to AI'}
+                      <span className={`text-[10px] font-bold uppercase text-center leading-tight px-1 ${isRecording ? 'text-white' : 'text-stone-500'}`}>
+                        {isRecording ? 'Tap to Stop' : audioBlob ? 'Audio Ready' : 'Dictate to AI'}
                       </span>
                     </button>
                   </div>
+
+                  {/* Live Transcription Preview */}
+                  {(isRecording || liveTranscription) && (
+                    <div className="bg-stone-900 text-stone-100 p-4 rounded-xl text-sm italic relative overflow-hidden">
+                      {isRecording && (
+                        <div className="absolute top-0 left-0 w-full h-1 bg-red-500/20">
+                          <div className="h-full bg-red-500 animate-[pulse_1s_ease-in-out_infinite]" style={{ width: '100%' }}></div>
+                        </div>
+                      )}
+                      <div className="flex items-center gap-2 mb-2">
+                        {isRecording && <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse"></div>}
+                        <span className="text-[10px] uppercase tracking-widest font-bold text-stone-400">
+                          {isRecording ? 'Listening...' : 'Recorded Audio'}
+                        </span>
+                      </div>
+                      <p className="opacity-90">{liveTranscription || "Listening for speech..."}</p>
+                    </div>
+                  )}
 
                   {/* Photo Preview Strip */}
                   {currentImages.length > 0 && (
