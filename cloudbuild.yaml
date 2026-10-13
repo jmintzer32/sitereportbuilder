@@ -23,6 +23,9 @@ steps:
       - '--allow-unauthenticated'
       - '--set-env-vars'
       - 'NODE_ENV=production'
+      # The Gemini key lives in Secret Manager (secret name: gemini-api-key)
+      - '--set-secrets'
+      - 'GEMINI_API_KEY=gemini-api-key:latest'
 
 images:
   - 'gcr.io/$PROJECT_ID/clark-qc-builder'

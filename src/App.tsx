@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { GoogleGenAI, Type } from "@google/genai";
+import { flushSync } from 'react-dom';
 import { 
   Camera, Mic, Square, Send, Loader2, CheckCircle2, 
   AlertCircle, HardHat, FileText, Settings, Download, 
@@ -18,6 +18,7 @@ interface Entry {
   actionResponsibility: string;
   transcription?: string;
   audioData?: string;
+  audioMimeType?: string;
   pendingAI?: boolean;
 }
 
@@ -75,6 +76,37 @@ const TEMPLATES: TemplateConfig[] = [
 
 const CLARK_LOGO_BASE64 = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 500 150'%3E%3Crect width='500' height='150' fill='%23001430'/%3E%3Ctext x='50%25' y='50%25' dominant-baseline='middle' text-anchor='middle' font-family='serif' font-weight='bold' font-size='80' fill='white'%3ECLARK%3C/text%3E%3Ctext x='50%25' y='85%25' dominant-baseline='middle' text-anchor='middle' font-family='sans-serif' font-weight='bold' font-size='20' fill='white' letter-spacing='10'%3ECONSTRUCTION%3C/text%3E%3C/svg%3E";
 
+interface AnalysisResult {
+  Transcription: string;
+  Observation: string;
+  Action_And_Responsibility: string;
+}
+
+// Sends the dictation (and photos for context) to our server, which calls Gemini.
+async function analyzeEntry(images: string[], audio: string, audioMimeType: string | undefined, timeoutMs: number): Promise<AnalysisResult> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch('/api/analyze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        images: images.map(img => img.split(',')[1]),
+        audio,
+        audioMimeType,
+      }),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || `AI request failed (${res.status})`);
+    }
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 const ReportContent = ({ currentTemplate, projectInfo, entries }: { currentTemplate: TemplateConfig, projectInfo: ProjectInfo | null, entries: Entry[] }) => (
   <div style={{ 
     backgroundColor: '#ffffff', 
@@ -118,6 +150,7 @@ const ReportContent = ({ currentTemplate, projectInfo, entries }: { currentTempl
       {entries.map((entry, index) => (
         <div 
           key={entry.id} 
+          data-pdf-break=""
           style={{ 
             display: 'flex', 
             flexDirection: 'column', 
@@ -145,12 +178,16 @@ const ReportContent = ({ currentTemplate, projectInfo, entries }: { currentTempl
               {entry.images.map((img, i) => (
                 <div 
                   key={i} 
+                  // The first photo stays with its "ITEM n" label; later photos may start a new page.
+                  data-pdf-break={i > 0 ? '' : undefined}
+                  data-pdf-keep=""
                   style={{ 
                     width: '100%',
                     aspectRatio: '4/3', 
                     borderRadius: '4px', 
                     overflow: 'hidden', 
-                    border: '2px solid #0066B3' 
+                    border: '2px solid #0066B3',
+                    breakInside: 'avoid'
                   }}
                 >
                   <img src={img} alt="Site" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
@@ -180,9 +217,10 @@ const ReportContent = ({ currentTemplate, projectInfo, entries }: { currentTempl
       ))}
 
       {/* PDF Footer Sign-off */}
-      <div style={{ 
+      <div data-pdf-break="" data-pdf-keep="" data-pdf-end="" style={{ 
         marginTop: 'auto', 
         paddingTop: '20px', 
+        breakInside: 'avoid',
         display: 'grid', 
         gridTemplateColumns: '1fr 1fr 1fr', 
         gap: '40px', 
@@ -221,6 +259,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
   const [entries, setEntries] = useState<Entry[]>([]);
   const [projectInfo, setProjectInfo] = useState<ProjectInfo | null>(null);
   const [isSettingUp, setIsSettingUp] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   
   // Temporary state for the setup form
   const [tempInfo, setTempInfo] = useState<ProjectInfo>({
@@ -252,14 +291,17 @@ function MainApp({ onReset }: { onReset: () => void }) {
 
   useEffect(() => {
     if (!isInitializing) {
-      set('constructReport_entries', entries);
+      set('constructReport_entries', entries).catch(err => {
+        console.error("Failed to save entries", err);
+        setError("Could not save to device storage. Your device may be low on space.");
+      });
     }
   }, [entries, isInitializing]);
 
   useEffect(() => {
     if (!isInitializing) {
       if (projectInfo) {
-        set('constructReport_projectInfo', projectInfo);
+        set('constructReport_projectInfo', projectInfo).catch(err => console.error("Failed to save project info", err));
       } else {
         del('constructReport_projectInfo');
       }
@@ -268,9 +310,9 @@ function MainApp({ onReset }: { onReset: () => void }) {
 
   const [currentImages, setCurrentImages] = useState<string[]>([]);
   const [audioBlob, setAudioBlob] = useState<Blob | null>(null);
+  const [pendingShareFile, setPendingShareFile] = useState<File | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [selectedTemplate, setSelectedTemplate] = useState<TemplateType>('QUICK');
   const [isExporting, setIsExporting] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -304,7 +346,6 @@ function MainApp({ onReset }: { onReset: () => void }) {
   // Form fields for manual entry/edit
   const [manualObservation, setManualObservation] = useState('');
   const [manualActionResponsibility, setManualActionResponsibility] = useState('');
-  const [apiKey, setApiKey] = useState<string>('');
   const [liveTranscription, setLiveTranscription] = useState('');
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -313,21 +354,12 @@ function MainApp({ onReset }: { onReset: () => void }) {
   const reportRef = useRef<HTMLDivElement>(null);
   const recognitionRef = useRef<any>(null);
 
-  useEffect(() => {
-    fetch('/api/config')
-      .then(res => res.json())
-      .then(data => {
-        if (data.apiKey) setApiKey(data.apiKey);
-      })
-      .catch(err => console.error("Failed to load config", err));
-  }, []);
-
   const handleCapturePhoto = () => {
     fileInputRef.current?.click();
   };
 
   const compressImage = (file: File): Promise<string> => {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.onload = (event) => {
         const img = new window.Image();
@@ -357,8 +389,10 @@ function MainApp({ onReset }: { onReset: () => void }) {
           ctx?.drawImage(img, 0, 0, width, height);
           resolve(canvas.toDataURL('image/jpeg', 0.7));
         };
+        img.onerror = () => reject(new Error(`Could not read image ${file.name}`));
         img.src = event.target?.result as string;
       };
+      reader.onerror = () => reject(reader.error);
       reader.readAsDataURL(file);
     });
   };
@@ -366,11 +400,18 @@ function MainApp({ onReset }: { onReset: () => void }) {
   const onFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (files) {
-      const compressedImages = await Promise.all(
-        Array.from(files).map(file => compressImage(file))
-      );
-      setCurrentImages(prev => [...prev, ...compressedImages]);
+      try {
+        const compressedImages = await Promise.all(
+          Array.from(files).map((file: File) => compressImage(file))
+        );
+        setCurrentImages(prev => [...prev, ...compressedImages]);
+      } catch (err) {
+        console.error(err);
+        setError("One of the photos could not be loaded. Try a different photo.");
+      }
     }
+    // Reset so picking the same photo again still fires onChange
+    e.target.value = '';
   };
 
   const removeCurrentImage = (index: number) => {
@@ -419,13 +460,14 @@ function MainApp({ onReset }: { onReset: () => void }) {
       playAudioFeedback('start');
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const mediaRecorder = new MediaRecorder(stream);
+      setAudioBlob(null);
       mediaRecorderRef.current = mediaRecorder;
       audioChunksRef.current = [];
       mediaRecorder.ondataavailable = (event) => {
         if (event.data.size > 0) audioChunksRef.current.push(event.data);
       };
       mediaRecorder.onstop = () => {
-        const blob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+        const blob = new Blob(audioChunksRef.current, { type: mediaRecorder.mimeType || 'audio/webm' });
         setAudioBlob(blob);
       };
       mediaRecorder.start();
@@ -454,6 +496,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
         recognitionRef.current = recognition;
       }
     } catch (err) {
+      console.error(err);
       setError("Microphone access denied.");
     }
   };
@@ -486,7 +529,8 @@ function MainApp({ onReset }: { onReset: () => void }) {
   };
 
   const handleAddOrUpdateEntry = async () => {
-    if (currentImages.length === 0 && !editingId) {
+    if (isRecording) stopRecording();
+    if (currentImages.length === 0) {
       setError("Please capture at least one photo.");
       return;
     }
@@ -495,78 +539,43 @@ function MainApp({ onReset }: { onReset: () => void }) {
     setError(null);
 
     try {
+      // When editing, keep the existing AI/audio data unless a new dictation was recorded.
+      const existing = editingId ? entries.find(e => e.id === editingId) : undefined;
       let observation = manualObservation;
       let actionResponsibility = manualActionResponsibility;
-      let transcription = "";
-      let pendingAI = false;
-      let audioBase64Data = "";
+      let transcription = existing?.transcription || "";
+      let pendingAI = existing?.pendingAI || false;
+      let audioBase64Data = existing?.audioData || "";
+      let audioMimeType = existing?.audioMimeType;
 
       // If we have audio, try to use Gemini to transcribe and analyze
       if (audioBlob) {
-        audioBase64Data = await new Promise<string>((resolve) => {
+        audioMimeType = audioBlob.type || 'audio/webm';
+        audioBase64Data = await new Promise<string>((resolve, reject) => {
           const reader = new FileReader();
           reader.onloadend = () => resolve((reader.result as string).split(',')[1]);
+          reader.onerror = () => reject(reader.error);
           reader.readAsDataURL(audioBlob);
         });
 
         if (isLowConnection()) {
           // Offline or Low Service mode
-          observation = liveTranscription.trim() || "Pending network connection... Summary will be generated later.";
-          actionResponsibility = "Pending...";
+          observation = liveTranscription.trim() || manualObservation || "Pending network connection... Summary will be generated later.";
+          actionResponsibility = manualActionResponsibility || "Pending...";
           transcription = liveTranscription.trim() || "Audio saved. Transcription pending network connection.";
           pendingAI = true;
         } else {
           try {
-            if (!apiKey) {
-              throw new Error("API Key not loaded. Please refresh the page.");
-            }
-            
-            const ai = new GoogleGenAI({ apiKey });
-
-            const imageParts = currentImages.map(img => ({
-              inlineData: { mimeType: "image/jpeg", data: img.split(',')[1] }
-            }));
-
-            const timeoutPromise = new Promise<never>((_, reject) => 
-              setTimeout(() => reject(new Error("API Timeout - Low Service Area")), 15000)
-            );
-
-            const apiCall = ai.models.generateContent({
-              model: "gemini-3-flash-preview",
-              contents: {
-                parts: [
-                  ...imageParts,
-                  { inlineData: { mimeType: "audio/webm", data: audioBase64Data } },
-                  { text: "Process the accompanying audio dictation and site photos (if provided). Clean up the audio transcription to have proper grammar and professional wording, but DO NOT add any outside analysis, assumptions, or new information. Output a JSON object with three keys: Transcription (the exact raw text of what was said), Observation (the cleaned-up, grammatically correct version of the dictation), and Action_And_Responsibility (extract any proposed actions and responsible trades mentioned, combined into one clear statement, or leave blank)." },
-                ],
-              },
-              config: {
-                responseMimeType: "application/json",
-                responseSchema: {
-                  type: Type.OBJECT,
-                  properties: {
-                    Transcription: { type: Type.STRING },
-                    Observation: { type: Type.STRING },
-                    Action_And_Responsibility: { type: Type.STRING },
-                  },
-                  required: ["Transcription", "Observation", "Action_And_Responsibility"],
-                },
-              },
-            });
-
-            const response = await Promise.race([apiCall, timeoutPromise]);
-
-            if (response.text) {
-              const data = JSON.parse(response.text);
-              observation = data.Observation;
-              actionResponsibility = data.Action_And_Responsibility;
-              transcription = data.Transcription;
-            }
+            const data = await analyzeEntry(currentImages, audioBase64Data, audioMimeType, 30000);
+            observation = data.Observation;
+            actionResponsibility = data.Action_And_Responsibility;
+            transcription = data.Transcription;
+            pendingAI = false;
           } catch (apiErr) {
             console.error("API Error during entry creation:", apiErr);
             // Fallback to pending if API fails (e.g., flaky connection)
-            observation = liveTranscription.trim() || "API Error. Summary will be generated later.";
-            actionResponsibility = "Pending...";
+            observation = liveTranscription.trim() || manualObservation || "API Error. Summary will be generated later.";
+            actionResponsibility = manualActionResponsibility || "Pending...";
             transcription = liveTranscription.trim() || "Audio saved. Transcription pending retry.";
             pendingAI = true;
           }
@@ -580,18 +589,20 @@ function MainApp({ onReset }: { onReset: () => void }) {
         actionResponsibility: actionResponsibility || manualActionResponsibility,
         transcription: transcription,
         audioData: audioBase64Data || undefined,
+        audioMimeType: audioBase64Data ? audioMimeType : undefined,
         pendingAI: pendingAI
       };
 
       if (editingId) {
-        setEntries(entries.map(e => e.id === editingId ? newEntry : e));
+        setEntries(prev => prev.map(e => e.id === editingId ? newEntry : e));
       } else {
-        setEntries([...entries, newEntry]);
+        setEntries(prev => [...prev, newEntry]);
       }
 
       resetCapture();
       setShowCapture(false);
     } catch (err) {
+      console.error(err);
       setError("Failed to process entry.");
     } finally {
       setIsLoading(false);
@@ -599,15 +610,23 @@ function MainApp({ onReset }: { onReset: () => void }) {
   };
 
   const resetCapture = () => {
+    if (isRecording) stopRecording();
     setCurrentImages([]);
     setAudioBlob(null);
+    setLiveTranscription('');
     setManualObservation('');
     setManualActionResponsibility('');
     setEditingId(null);
     setError(null);
   };
 
+  const closeCapture = () => {
+    resetCapture();
+    setShowCapture(false);
+  };
+
   const handleEdit = (entry: Entry) => {
+    resetCapture();
     setEditingId(entry.id);
     setCurrentImages(entry.images);
     setManualObservation(entry.observation);
@@ -616,7 +635,8 @@ function MainApp({ onReset }: { onReset: () => void }) {
   };
 
   const handleDelete = (id: string) => {
-    setEntries(entries.filter(e => e.id !== id));
+    setEntries(prev => prev.filter(e => e.id !== id));
+    if (editingId === id) closeCapture();
     setItemToDelete(null);
   };
 
@@ -629,127 +649,150 @@ function MainApp({ onReset }: { onReset: () => void }) {
       return true;
     }
 
-    if (!apiKey) {
-      alert("API Key not loaded. The report will be generated with placeholders.");
-      return true;
-    }
-
     setIsExporting(true);
-    let updatedEntries = [...entries];
-    const ai = new GoogleGenAI({ apiKey });
+    const updates = new Map<string, Partial<Entry>>();
+    let failed = 0;
 
-    try {
-      for (let i = 0; i < pendingEntries.length; i++) {
-        const entry = pendingEntries[i];
-        
-        const imageParts = entry.images.map(img => ({
-          inlineData: { mimeType: "image/jpeg", data: img.split(',')[1] }
-        }));
-
-        const timeoutPromise = new Promise<never>((_, reject) => 
-          setTimeout(() => reject(new Error("API Timeout - Low Service Area")), 30000)
-        );
-
-        const apiCall = ai.models.generateContent({
-          model: "gemini-3-flash-preview",
-          contents: {
-            parts: [
-              ...imageParts,
-              { inlineData: { mimeType: "audio/webm", data: entry.audioData! } },
-              { text: "Process the accompanying audio dictation and site photos (if provided). Clean up the audio transcription to have proper grammar and professional wording, but DO NOT add any outside analysis, assumptions, or new information. Output a JSON object with three keys: Transcription (the exact raw text of what was said), Observation (the cleaned-up, grammatically correct version of the dictation), and Action_And_Responsibility (extract any proposed actions and responsible trades mentioned, combined into one clear statement, or leave blank)." },
-            ],
-          },
-          config: {
-            responseMimeType: "application/json",
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                Transcription: { type: Type.STRING },
-                Observation: { type: Type.STRING },
-                Action_And_Responsibility: { type: Type.STRING },
-              },
-              required: ["Transcription", "Observation", "Action_And_Responsibility"],
-            },
-          },
+    for (const entry of pendingEntries) {
+      try {
+        const data = await analyzeEntry(entry.images, entry.audioData!, entry.audioMimeType, 45000);
+        updates.set(entry.id, {
+          observation: data.Observation,
+          actionResponsibility: data.Action_And_Responsibility,
+          transcription: data.Transcription,
+          pendingAI: false
         });
-
-        const response = await Promise.race([apiCall, timeoutPromise]);
-
-        if (response.text) {
-          const data = JSON.parse(response.text);
-          updatedEntries = updatedEntries.map(e => 
-            e.id === entry.id 
-              ? { 
-                  ...e, 
-                  observation: data.Observation, 
-                  actionResponsibility: data.Action_And_Responsibility, 
-                  transcription: data.Transcription,
-                  pendingAI: false 
-                } 
-              : e
-          );
-        }
+      } catch (err) {
+        console.error("Failed to process pending entry:", err);
+        failed++;
       }
-      return true;
-    } catch (err) {
-      console.error("Failed to process pending entries:", err);
-      alert("Failed to process some pending AI summaries (e.g., quota exceeded). The report will be generated with placeholders.");
-      return true;
-    } finally {
-      setEntries(updatedEntries);
-      setIsExporting(false);
     }
+
+    if (updates.size > 0) {
+      // flushSync so the hidden report is re-rendered before the PDF is captured
+      flushSync(() => {
+        setEntries(prev => prev.map(e => updates.has(e.id) ? { ...e, ...updates.get(e.id) } : e));
+      });
+    }
+    setIsExporting(false);
+
+    if (failed > 0) {
+      alert("Some AI summaries could not be generated right now. The report will use the saved text for those items.");
+    }
+    return true;
   };
 
   const generatePDF = async () => {
-    if (!reportRef.current) return null;
-    
-    const canvas = await html2canvas(reportRef.current, {
-      scale: 2,
-      useCORS: true,
-      backgroundColor: '#ffffff',
-      windowWidth: 794,
-      width: 794,
-      onclone: (clonedDoc) => {
-        const el = clonedDoc.getElementById('report-capture-root');
-        if (el) {
-          el.style.visibility = 'visible';
-          el.style.position = 'relative';
-          el.style.left = '0';
-          el.style.opacity = '1';
-          el.style.width = '794px';
-        }
-        const content = el?.firstElementChild as HTMLElement;
-        if (content) {
-          content.style.width = '794px';
-        }
-      }
-    });
+    const root = reportRef.current;
+    if (!root) return null;
 
-    const imgData = canvas.toDataURL('image/jpeg', 0.95);
+    // Make sure photos and fonts are ready before measuring/capturing
+    await document.fonts?.ready;
+    await Promise.all(Array.from<HTMLImageElement>(root.querySelectorAll<HTMLImageElement>('img')).map(img =>
+      img.complete ? Promise.resolve() : new Promise(res => { img.onload = img.onerror = () => res(null); })
+    ));
+
+    const PAGE_WIDTH_MM = 210;
+    const PAGE_HEIGHT_MM = 297;
+    const PAGE_WIDTH_PX = 794;
+    const PX_PER_MM = PAGE_WIDTH_PX / PAGE_WIDTH_MM;
+    const PAGE_HEIGHT_PX = PAGE_HEIGHT_MM * PX_PER_MM;
+    const MARGIN_MM = 12;
+    const MARGIN_PX = MARGIN_MM * PX_PER_MM;
+
+    // Measure the report (rendered off-screen at A4 width) to find where pages can break
+    // without cutting through a photo or a block of text.
+    const rootTop = root.getBoundingClientRect().top;
+    const measure = (el: Element) => {
+      const r = el.getBoundingClientRect();
+      return { top: r.top - rootTop, bottom: r.bottom - rootTop };
+    };
+    const keepTogether = Array.from<HTMLElement>(root.querySelectorAll<HTMLElement>('[data-pdf-keep], h2, h4, p')).map(measure);
+    const isCleanBreak = (y: number) => keepTogether.every(k => !(k.top < y - 0.5 && y + 0.5 < k.bottom));
+    const breakPoints = Array.from<HTMLElement>(root.querySelectorAll<HTMLElement>('[data-pdf-break]'))
+      .map(el => measure(el).top)
+      .filter(isCleanBreak)
+      .sort((a, b) => a - b);
+    const endEl = root.querySelector('[data-pdf-end]');
+    const contentEnd = endEl ? measure(endEl).bottom : root.scrollHeight;
+
+    const slices: { start: number; end: number }[] = [];
+    let start = 0;
+    while (start < contentEnd - 1) {
+      // First page starts at the very top (header is full-bleed); later pages get a top margin.
+      const capacity = slices.length === 0 ? PAGE_HEIGHT_PX - MARGIN_PX : PAGE_HEIGHT_PX - 2 * MARGIN_PX;
+      const limit = start + capacity;
+      if (contentEnd <= limit) {
+        slices.push({ start, end: contentEnd });
+        break;
+      }
+      const candidates = breakPoints.filter(b => b > start + 1 && b <= limit);
+      // If a single block is taller than a page, there is no clean break; cut at the page limit.
+      const end = candidates.length > 0 ? candidates[candidates.length - 1] : limit;
+      slices.push({ start, end });
+      start = end;
+    }
+
     const pdf = new jsPDF('p', 'mm', 'a4');
-    const imgWidth = 210;
-    const pageHeight = 297;
-    const imgHeight = (canvas.height * imgWidth) / canvas.width;
-    
-    let heightLeft = imgHeight;
-    let position = 0;
-    pdf.addImage(imgData, 'JPEG', 0, position, imgWidth, imgHeight);
     pdf.setFontSize(8);
     pdf.setTextColor(150);
-    pdf.text(`Page 1`, imgWidth - 20, pageHeight - 10);
-    
-    heightLeft -= pageHeight;
-    let pageCount = 1;
-    while (heightLeft >= 0) {
-      position = heightLeft - imgHeight;
-      pdf.addPage();
-      pageCount++;
-      pdf.addImage(imgData, 'JPEG', 0, position, imgWidth, imgHeight);
-      pdf.text(`Page ${pageCount}`, imgWidth - 20, pageHeight - 10);
-      heightLeft -= pageHeight;
+
+    for (let i = 0; i < slices.length; i++) {
+      const { start: sliceStart, end: sliceEnd } = slices[i];
+      const sliceHeight = Math.ceil(sliceEnd - sliceStart);
+
+      // Capture one page at a time; this keeps each canvas small enough for mobile Safari.
+      const canvas = await html2canvas(root, {
+        scale: 2,
+        useCORS: true,
+        backgroundColor: '#ffffff',
+        windowWidth: PAGE_WIDTH_PX,
+        width: PAGE_WIDTH_PX,
+        height: sliceHeight,
+        scrollX: 0,
+        scrollY: 0,
+        onclone: (clonedDoc) => {
+          const el = clonedDoc.getElementById('report-capture-root');
+          if (!el) return;
+          el.style.visibility = 'visible';
+          el.style.position = 'absolute';
+          el.style.top = '0';
+          el.style.left = '0';
+          el.style.opacity = '1';
+          el.style.width = `${PAGE_WIDTH_PX}px`;
+          el.style.height = `${sliceHeight}px`;
+          el.style.overflow = 'hidden';
+          const content = el.firstElementChild as HTMLElement | null;
+          if (content) {
+            content.style.width = `${PAGE_WIDTH_PX}px`;
+            content.style.marginTop = `-${sliceStart}px`;
+          }
+        }
+      });
+
+      if (i > 0) pdf.addPage();
+      const imgData = canvas.toDataURL('image/jpeg', 0.92);
+      const y = i === 0 ? 0 : MARGIN_MM;
+      pdf.addImage(imgData, 'JPEG', 0, y, PAGE_WIDTH_MM, sliceHeight / PX_PER_MM);
+      pdf.text(`Page ${i + 1} of ${slices.length}`, PAGE_WIDTH_MM - 12, PAGE_HEIGHT_MM - 6, { align: 'right' });
     }
     return pdf;
+  };
+
+  const reportFileName = () => {
+    const safeName = (projectInfo?.name || 'Site').replace(/[\\/:*?"<>|]+/g, '-').trim() || 'Site';
+    return `Report_${safeName}.pdf`;
+  };
+
+  const shareFile = async (file: File) => {
+    await navigator.share({
+      files: [file],
+      title: 'Site Visit Report',
+      text: `Attached is the site visit report for ${projectInfo?.name}.`
+    });
+    setPendingShareFile(null);
+    setShowPostSharePrompt(true);
+    setShowPreview(false);
   };
 
   const handleShare = async () => {
@@ -762,25 +805,21 @@ function MainApp({ onReset }: { onReset: () => void }) {
       if (!pdf) return;
 
       const pdfBlob = pdf.output('blob');
-      const fileName = `Report_${projectInfo?.name || 'Site'}.pdf`;
-      const file = new File([pdfBlob], fileName, { type: 'application/pdf' });
+      const file = new File([pdfBlob], reportFileName(), { type: 'application/pdf' });
 
       // Try Web Share API first
-      if (navigator.share) {
+      if (navigator.share && (!navigator.canShare || navigator.canShare({ files: [file] }))) {
         try {
-          const shareData = {
-            files: [file],
-            title: 'Site Visit Report',
-            text: `Attached is the site visit report for ${projectInfo?.name}.`
-          };
-          
-          // Attempt to share
-          await navigator.share(shareData);
-          
-          setShowPostSharePrompt(true);
-          setShowPreview(false);
+          await shareFile(file);
           return;
-        } catch (shareErr) {
+        } catch (shareErr: any) {
+          if (shareErr?.name === 'AbortError') return; // user closed the share sheet
+          if (shareErr?.name === 'NotAllowedError') {
+            // Building the PDF took too long and the browser no longer treats this as a tap.
+            // Ask for one more tap to open the share sheet.
+            setPendingShareFile(file);
+            return;
+          }
           console.warn("Share failed, falling back to print:", shareErr);
           // Fall through to print
         }
@@ -788,18 +827,8 @@ function MainApp({ onReset }: { onReset: () => void }) {
 
       // Fallback to Print
       window.print();
-      
-      const handleReturn = () => {
-        setShowPostSharePrompt(true);
-        setShowPreview(false);
-        window.removeEventListener('focus', handleReturn);
-      };
-      
-      window.addEventListener('focus', handleReturn);
-      setTimeout(() => {
-        setShowPostSharePrompt(true);
-        setShowPreview(false);
-      }, 1500);
+      setShowPostSharePrompt(true);
+      setShowPreview(false);
     } catch (err) {
       console.error("Share error:", err);
       alert("Failed to generate report for sharing.");
@@ -817,7 +846,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
       const pdf = await generatePDF();
       if (!pdf) return;
 
-      pdf.save(`Report_${projectInfo?.name || 'Site'}.pdf`);
+      pdf.save(reportFileName());
       
       setTimeout(() => {
         setShowPostSharePrompt(true);
@@ -986,6 +1015,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
                         </button>
                         <button
                           onClick={() => { handleShare(); setShowMenu(false); }}
+                          disabled={isExporting}
                           className="w-full flex items-center gap-3 px-4 py-3 text-sm font-bold hover:bg-stone-50 rounded-xl transition-colors"
                         >
                           <Share2 className="w-4 h-4 text-clark-bright" />
@@ -1081,7 +1111,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
                 <FileText className="w-12 h-12 text-stone-200 mx-auto mb-4" />
                 <p className="text-stone-400 text-sm font-medium">No observations yet.</p>
                 <button 
-                  onClick={() => setShowCapture(true)}
+                  onClick={() => { resetCapture(); setShowCapture(true); }}
                   className="mt-4 text-clark-medium font-bold text-sm"
                 >
                   Start First Entry
@@ -1140,7 +1170,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
               <div className="p-6 space-y-6">
                 <div className="flex items-center justify-between">
                   <h3 className="font-bold text-lg">{editingId ? 'Edit Entry' : 'New Entry'}</h3>
-                  <button onClick={() => setShowCapture(false)} className="text-stone-400 hover:text-stone-600">
+                  <button onClick={closeCapture} className="text-stone-400 hover:text-stone-600">
                     <X className="w-6 h-6" />
                   </button>
                 </div>
@@ -1204,7 +1234,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
                           <img src={img} alt="Preview" className="w-full h-full object-cover" />
                           <button 
                             onClick={() => removeCurrentImage(idx)}
-                            className="absolute top-1 right-1 bg-red-500 text-white p-1 rounded-full opacity-0 group-hover:opacity-100 transition-opacity"
+                            className="absolute top-1 right-1 bg-red-500 text-white p-1 rounded-full opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity"
                           >
                             <X className="w-3 h-3" />
                           </button>
@@ -1238,7 +1268,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
 
                 <button
                   onClick={handleAddOrUpdateEntry}
-                  disabled={isLoading || (currentImages.length === 0 && !editingId)}
+                  disabled={isLoading || currentImages.length === 0}
                   className="w-full bg-clark-navy text-white py-4 rounded-xl font-bold flex items-center justify-center gap-3 disabled:opacity-30 shadow-lg active:scale-[0.98] transition-transform"
                 >
                   {isLoading ? <Loader2 className="w-5 h-5 animate-spin" /> : <Plus className="w-5 h-5" />}
@@ -1291,7 +1321,8 @@ function MainApp({ onReset }: { onReset: () => void }) {
                   </button>
                   <button 
                     onClick={handleShare}
-                    className="flex-1 bg-clark-bright text-white py-3 rounded-xl font-bold flex items-center justify-center gap-2 shadow-lg active:scale-95 transition-all"
+                    disabled={isExporting}
+                    className="flex-1 bg-clark-bright text-white py-3 rounded-xl font-bold flex items-center justify-center gap-2 shadow-lg active:scale-95 transition-all disabled:opacity-50"
                   >
                     <Share2 className="w-4 h-4" />
                     Share / Print
@@ -1318,7 +1349,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
       <div 
         id="report-capture-root"
         className="fixed top-0 left-0 bg-white"
-        style={{ width: '100%', zIndex: -100, visibility: 'hidden', pointerEvents: 'none' }}
+        style={{ width: '794px', zIndex: -100, visibility: 'hidden', pointerEvents: 'none' }}
         ref={reportRef}
       >
         <ReportContent 
@@ -1354,6 +1385,42 @@ function MainApp({ onReset }: { onReset: () => void }) {
                 </button>
                 <button 
                   onClick={() => setItemToDelete(null)}
+                  className="w-full bg-stone-100 text-stone-700 py-3 rounded-xl font-bold active:scale-95 transition-all"
+                >
+                  Cancel
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+
+        {pendingShareFile && (
+          <div className="fixed inset-0 z-[200] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 no-print">
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.9 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.9 }}
+              className="bg-white w-full max-w-sm rounded-3xl overflow-hidden flex flex-col p-6 text-center space-y-6"
+            >
+              <div className="w-16 h-16 bg-clark-bright/10 text-clark-bright rounded-full flex items-center justify-center mx-auto">
+                <FileText className="w-8 h-8" />
+              </div>
+              <div>
+                <h3 className="text-xl font-black text-clark-navy mb-2">Report Ready</h3>
+                <p className="text-sm text-stone-500 font-medium">Tap Share to send your PDF.</p>
+              </div>
+              <div className="flex flex-col gap-3">
+                <button 
+                  onClick={() => shareFile(pendingShareFile).catch(err => {
+                    if (err?.name !== 'AbortError') console.error("Share error:", err);
+                  })}
+                  className="w-full bg-clark-bright text-white py-3 rounded-xl font-bold flex items-center justify-center gap-2 active:scale-95 transition-all"
+                >
+                  <Share2 className="w-4 h-4" />
+                  Share
+                </button>
+                <button 
+                  onClick={() => setPendingShareFile(null)}
                   className="w-full bg-stone-100 text-stone-700 py-3 rounded-xl font-bold active:scale-95 transition-all"
                 >
                   Cancel
