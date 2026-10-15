@@ -4,16 +4,21 @@ import {
   Camera, Mic, Square, Send, Loader2, CheckCircle2, 
   AlertCircle, HardHat, FileText, Settings, Download, 
   Layout, ShieldAlert, ClipboardList, Eye, Trash2, Edit3, Plus, X, Share2, Mail,
-  MoreVertical, Smartphone, Image
+  MoreVertical, Smartphone, Image, GripVertical, ChevronLeft, ChevronRight, Pencil
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import jsPDF from 'jspdf';
 import html2canvas from 'html2canvas';
 import { get, set, del } from 'idb-keyval';
+import MarkupEditor from './MarkupEditor';
+import { PhotoMarkup, Shape, renderMarkup } from './markup';
 
 interface Entry {
   id: string;
+  /** Photos as shown in the report (with any markup drawn in) */
   images: string[];
+  /** Per photo: the original and its markup, so markup stays editable. null = no markup. */
+  markups?: (PhotoMarkup | null)[];
   observation: string;
   actionResponsibility: string;
   transcription?: string;
@@ -309,6 +314,12 @@ function MainApp({ onReset }: { onReset: () => void }) {
   }, [projectInfo, isInitializing]);
 
   const [currentImages, setCurrentImages] = useState<string[]>([]);
+  const [currentMarkups, setCurrentMarkups] = useState<(PhotoMarkup | null)[]>([]);
+  const [viewingPhoto, setViewingPhoto] = useState<number | null>(null);
+  const [markingPhoto, setMarkingPhoto] = useState<number | null>(null);
+  const [drag, setDrag] = useState<{ from: number; dy: number; target: number; step: number } | null>(null);
+  const dragRef = useRef<{ startY: number; rects: DOMRect[] } | null>(null);
+  const itemRefs = useRef<(HTMLDivElement | null)[]>([]);
   const [audioBlob, setAudioBlob] = useState<Blob | null>(null);
   const [pendingShareFile, setPendingShareFile] = useState<File | null>(null);
   const [isRecording, setIsRecording] = useState(false);
@@ -405,6 +416,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
           Array.from(files).map((file: File) => compressImage(file))
         );
         setCurrentImages(prev => [...prev, ...compressedImages]);
+        setCurrentMarkups(prev => [...prev, ...compressedImages.map(() => null)]);
       } catch (err) {
         console.error(err);
         setError("One of the photos could not be loaded. Try a different photo.");
@@ -416,6 +428,99 @@ function MainApp({ onReset }: { onReset: () => void }) {
 
   const removeCurrentImage = (index: number) => {
     setCurrentImages(prev => prev.filter((_, i) => i !== index));
+    setCurrentMarkups(prev => prev.filter((_, i) => i !== index));
+  };
+
+  const saveMarkup = async (index: number, shapes: Shape[]) => {
+    const original = currentMarkups[index]?.original ?? currentImages[index];
+    try {
+      const rendered = await renderMarkup(original, shapes);
+      setCurrentImages(prev => prev.map((img, i) => i === index ? rendered : img));
+      setCurrentMarkups(prev => prev.map((mk, i) => i === index ? (shapes.length ? { original, shapes } : null) : mk));
+    } catch (err) {
+      console.error(err);
+      setError("Could not save the markup. Please try again.");
+    }
+    setMarkingPhoto(null);
+  };
+
+  // Hands the photo (with markup) to the phone's share sheet so it can be saved to Photos.
+  // Falls back to a normal download where sharing files isn't supported (e.g. desktop).
+  const savePhotoToDevice = async (index: number) => {
+    const dataUrl = currentImages[index];
+    if (!dataUrl) return;
+    const itemNo = editingId ? entries.findIndex(e => e.id === editingId) + 1 : entries.length + 1;
+    const project = (projectInfo?.name || 'Site').replace(/[\\/:*?"<>|]+/g, '-').trim() || 'Site';
+    const fileName = `${project}_Item${itemNo}_Photo${index + 1}.jpg`;
+    const blob = await (await fetch(dataUrl)).blob();
+    const file = new File([blob], fileName, { type: 'image/jpeg' });
+    if (navigator.canShare?.({ files: [file] })) {
+      try {
+        await navigator.share({ files: [file] });
+        return;
+      } catch (err: any) {
+        if (err?.name === 'AbortError') return;
+        console.warn("Share failed, falling back to download:", err);
+      }
+    }
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  // ----- Drag to reorder (only the grip handle starts a drag, so scrolling still works) -----
+  const onHandlePointerDown = (e: React.PointerEvent<HTMLButtonElement>, index: number) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const rects = itemRefs.current.slice(0, entries.length).map(el => el!.getBoundingClientRect());
+    const gap = rects.length > 1 ? rects[1].top - rects[0].bottom : 16;
+    e.currentTarget.setPointerCapture(e.pointerId);
+    dragRef.current = { startY: e.clientY, rects };
+    setDrag({ from: index, dy: 0, target: index, step: rects[index].height + gap });
+  };
+  const onHandlePointerMove = (e: React.PointerEvent<HTMLButtonElement>) => {
+    if (!drag || !dragRef.current) return;
+    const { startY, rects } = dragRef.current;
+    const dy = e.clientY - startY;
+    const center = rects[drag.from].top + rects[drag.from].height / 2 + dy;
+    let target = 0;
+    rects.forEach((r, i) => { if (i !== drag.from && r.top + r.height / 2 < center) target++; });
+    setDrag({ ...drag, dy, target });
+  };
+  const onHandlePointerUp = () => {
+    if (!drag) return;
+    const { from, target } = drag;
+    if (from !== target) {
+      setEntries(prev => {
+        const next = [...prev];
+        const [moved] = next.splice(from, 1);
+        next.splice(target, 0, moved);
+        return next;
+      });
+    }
+    dragRef.current = null;
+    setDrag(null);
+  };
+  const dragOffset = (i: number) => {
+    if (!drag) return 0;
+    if (i === drag.from) return drag.dy;
+    if (drag.from < drag.target && i > drag.from && i <= drag.target) return -drag.step;
+    if (drag.from > drag.target && i < drag.from && i >= drag.target) return drag.step;
+    return 0;
+  };
+  const moveEntry = (from: number, to: number) => {
+    if (to < 0 || to >= entries.length) return;
+    setEntries(prev => {
+      const next = [...prev];
+      const [moved] = next.splice(from, 1);
+      next.splice(to, 0, moved);
+      return next;
+    });
   };
 
   const playAudioFeedback = (type: 'start' | 'stop') => {
@@ -585,6 +690,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
       const newEntry: Entry = {
         id: editingId || Date.now().toString(),
         images: currentImages,
+        markups: currentMarkups.some(Boolean) ? currentMarkups : undefined,
         observation: observation || manualObservation,
         actionResponsibility: actionResponsibility || manualActionResponsibility,
         transcription: transcription,
@@ -612,6 +718,9 @@ function MainApp({ onReset }: { onReset: () => void }) {
   const resetCapture = () => {
     if (isRecording) stopRecording();
     setCurrentImages([]);
+    setCurrentMarkups([]);
+    setViewingPhoto(null);
+    setMarkingPhoto(null);
     setAudioBlob(null);
     setLiveTranscription('');
     setManualObservation('');
@@ -629,6 +738,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
     resetCapture();
     setEditingId(entry.id);
     setCurrentImages(entry.images);
+    setCurrentMarkups(entry.markups ?? entry.images.map(() => null));
     setManualObservation(entry.observation);
     setManualActionResponsibility(entry.actionResponsibility);
     setShowCapture(true);
@@ -1118,22 +1228,49 @@ function MainApp({ onReset }: { onReset: () => void }) {
                 </button>
               </div>
             )}
-            {entries.map((entry) => (
-              <motion.div 
-                layout
+            {entries.length > 1 && (
+              <p className="text-[10px] text-stone-400 font-medium px-2 -mb-2">Hold the grip and drag to reorder.</p>
+            )}
+            {entries.map((entry, index) => {
+              const isDragging = drag?.from === index;
+              return (
+              <div 
                 key={entry.id} 
-                onClick={() => handleEdit(entry)}
-                className="flex gap-4 relative group cursor-pointer border-b border-stone-200 pb-6 last:border-0"
+                ref={el => { itemRefs.current[index] = el; }}
+                onClick={() => { if (!drag) handleEdit(entry); }}
+                className={`flex gap-3 relative group cursor-pointer border-b border-stone-200 pb-6 last:border-0 ${isDragging ? 'z-10 bg-white rounded-2xl shadow-2xl ring-2 ring-clark-bright' : ''}`}
+                style={{
+                  transform: dragOffset(index) ? `translateY(${dragOffset(index)}px)` : undefined,
+                  transition: isDragging ? 'none' : 'transform 150ms ease',
+                }}
               >
+                <button
+                  type="button"
+                  aria-label={`Drag to reorder item ${index + 1}`}
+                  onPointerDown={(e) => onHandlePointerDown(e, index)}
+                  onPointerMove={onHandlePointerMove}
+                  onPointerUp={onHandlePointerUp}
+                  onPointerCancel={() => { dragRef.current = null; setDrag(null); }}
+                  onClick={(e) => e.stopPropagation()}
+                  onKeyDown={(e) => {
+                    if (e.key === 'ArrowUp') { e.preventDefault(); moveEntry(index, index - 1); }
+                    if (e.key === 'ArrowDown') { e.preventDefault(); moveEntry(index, index + 1); }
+                  }}
+                  className="w-8 flex-shrink-0 flex items-center justify-center text-stone-400 rounded-lg active:bg-stone-200 active:text-clark-medium cursor-grab"
+                  style={{ touchAction: 'none' }}
+                >
+                  <GripVertical className="w-5 h-5" />
+                </button>
                 <div className="w-24 h-24 rounded-xl overflow-hidden flex-shrink-0 bg-stone-100 relative shadow-sm">
-                  <img src={entry.images[0]} alt="Site" className="w-full h-full object-cover" />
+                  <img src={entry.images[0]} alt="Site" className="w-full h-full object-cover" draggable={false} />
                   {entry.images.length > 1 && (
                     <div className="absolute bottom-1 right-1 bg-black/60 text-white text-[8px] font-bold px-1.5 py-0.5 rounded-md">
                       +{entry.images.length - 1}
                     </div>
                   )}
                 </div>
-                <div className="flex-1 space-y-1 pr-8">
+                <div className="flex-1 min-w-0 space-y-1 pr-8">
+                  <span className="block text-[10px] font-black tracking-widest text-clark-medium">ITEM {index + 1}</span>
                   <p className="text-sm font-bold text-clark-navy line-clamp-2">
                     {entry.pendingAI && <span className="inline-flex items-center gap-1 bg-amber-100 text-amber-800 text-[10px] px-2 py-0.5 rounded-full mr-2 uppercase tracking-tight"><AlertCircle className="w-3 h-3" /> Pending AI</span>}
                     {entry.observation}
@@ -1153,8 +1290,9 @@ function MainApp({ onReset }: { onReset: () => void }) {
                     <Trash2 className="w-4 h-4" />
                   </button>
                 </div>
-              </motion.div>
-            ))}
+              </div>
+              );
+            })}
           </div>
         </section>
 
@@ -1228,18 +1366,35 @@ function MainApp({ onReset }: { onReset: () => void }) {
 
                   {/* Photo Preview Strip */}
                   {currentImages.length > 0 && (
-                    <div className="flex gap-2 overflow-x-auto pb-2 scrollbar-hide">
-                      {currentImages.map((img, idx) => (
-                        <div key={idx} className="w-20 h-20 rounded-xl overflow-hidden flex-shrink-0 relative group">
-                          <img src={img} alt="Preview" className="w-full h-full object-cover" />
-                          <button 
-                            onClick={() => removeCurrentImage(idx)}
-                            className="absolute top-1 right-1 bg-red-500 text-white p-1 rounded-full opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity"
-                          >
-                            <X className="w-3 h-3" />
-                          </button>
-                        </div>
-                      ))}
+                    <div className="space-y-1">
+                      <div className="flex gap-2 overflow-x-auto pb-2 scrollbar-hide">
+                        {currentImages.map((img, idx) => (
+                          <div key={idx} className="w-24 h-20 rounded-xl overflow-hidden flex-shrink-0 relative group">
+                            <button
+                              type="button"
+                              onClick={() => setViewingPhoto(idx)}
+                              aria-label={`Open photo ${idx + 1}`}
+                              className="block w-full h-full"
+                            >
+                              <img src={img} alt="Preview" className="w-full h-full object-cover" />
+                            </button>
+                            {currentMarkups[idx] && (
+                              <span className="absolute bottom-1 left-1 bg-black/60 text-white text-[8px] font-bold px-1.5 py-0.5 rounded-md uppercase flex items-center gap-1 pointer-events-none">
+                                <Pencil className="w-2.5 h-2.5" /> Marked
+                              </span>
+                            )}
+                            <button 
+                              type="button"
+                              aria-label={`Remove photo ${idx + 1}`}
+                              onClick={() => removeCurrentImage(idx)}
+                              className="absolute top-1 right-1 bg-red-500 text-white p-1 rounded-full opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity"
+                            >
+                              <X className="w-3 h-3" />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                      <p className="text-[10px] text-stone-400 font-medium">Tap a photo to mark it up or save it to your phone.</p>
                     </div>
                   )}
                 </div>
@@ -1358,6 +1513,62 @@ function MainApp({ onReset }: { onReset: () => void }) {
           entries={entries}
         />
       </div>
+
+      {/* Photo viewer: open a photo to mark it up or save it to the phone */}
+      {viewingPhoto !== null && currentImages[viewingPhoto] && markingPhoto === null && (
+        <div className="fixed inset-0 z-[350] bg-black flex flex-col text-white no-print" role="dialog" aria-label="Photo">
+          <div className="flex items-center justify-between px-3 py-2" style={{ paddingTop: 'max(0.5rem, env(safe-area-inset-top))' }}>
+            <button type="button" onClick={() => setViewingPhoto(null)} className="p-2 rounded-full hover:bg-white/10" aria-label="Close photo">
+              <X className="w-6 h-6" />
+            </button>
+            <span className="text-sm font-bold">Photo {viewingPhoto + 1} of {currentImages.length}</span>
+            <span className="w-10" />
+          </div>
+          <div className="flex-1 min-h-0 relative flex items-center justify-center p-2">
+            <img src={currentImages[viewingPhoto]} alt={`Photo ${viewingPhoto + 1}`} className="max-w-full max-h-full object-contain" />
+            {viewingPhoto > 0 && (
+              <button type="button" onClick={() => setViewingPhoto(viewingPhoto - 1)} aria-label="Previous photo"
+                className="absolute left-2 top-1/2 -translate-y-1/2 p-2 rounded-full bg-black/50">
+                <ChevronLeft className="w-6 h-6" />
+              </button>
+            )}
+            {viewingPhoto < currentImages.length - 1 && (
+              <button type="button" onClick={() => setViewingPhoto(viewingPhoto + 1)} aria-label="Next photo"
+                className="absolute right-2 top-1/2 -translate-y-1/2 p-2 rounded-full bg-black/50">
+                <ChevronRight className="w-6 h-6" />
+              </button>
+            )}
+          </div>
+          <div className="grid grid-cols-3 gap-2 p-3 bg-stone-900" style={{ paddingBottom: 'max(0.75rem, env(safe-area-inset-bottom))' }}>
+            <button type="button" onClick={() => setMarkingPhoto(viewingPhoto)}
+              className="flex flex-col items-center gap-1 py-2 rounded-xl bg-stone-800 text-xs font-bold">
+              <Pencil className="w-5 h-5" /> {currentMarkups[viewingPhoto] ? 'Edit markup' : 'Mark up'}
+            </button>
+            <button type="button" onClick={() => savePhotoToDevice(viewingPhoto)}
+              className="flex flex-col items-center gap-1 py-2 rounded-xl bg-clark-bright text-xs font-bold">
+              <Download className="w-5 h-5" /> Save to phone
+            </button>
+            <button type="button"
+              onClick={() => {
+                const idx = viewingPhoto;
+                removeCurrentImage(idx);
+                setViewingPhoto(currentImages.length > 1 ? Math.min(idx, currentImages.length - 2) : null);
+              }}
+              className="flex flex-col items-center gap-1 py-2 rounded-xl bg-stone-800 text-red-400 text-xs font-bold">
+              <Trash2 className="w-5 h-5" /> Delete
+            </button>
+          </div>
+        </div>
+      )}
+
+      {markingPhoto !== null && currentImages[markingPhoto] && (
+        <MarkupEditor
+          original={currentMarkups[markingPhoto]?.original ?? currentImages[markingPhoto]}
+          initialShapes={currentMarkups[markingPhoto]?.shapes ?? []}
+          onCancel={() => setMarkingPhoto(null)}
+          onDone={(shapes) => saveMarkup(markingPhoto, shapes)}
+        />
+      )}
 
       {/* Post-Share Prompt Modal */}
       <AnimatePresence>
