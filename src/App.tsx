@@ -179,6 +179,7 @@ const ReportContent = ({ currentTemplate, projectInfo, entries }: { currentTempl
           </div>
           
           <div style={{ display: 'flex', gap: '30px' }}>
+            {entry.images.length > 0 && (
             <div style={{ width: '240px', display: 'flex', flexDirection: 'column', gap: '10px', flexShrink: 0 }}>
               {entry.images.map((img, i) => (
                 <div 
@@ -199,6 +200,7 @@ const ReportContent = ({ currentTemplate, projectInfo, entries }: { currentTempl
                 </div>
               ))}
             </div>
+            )}
             <div style={{ flex: 1, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '30px' }}>
               <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
                 <h4 style={{ fontSize: '10px', fontWeight: '900', textTransform: 'uppercase', letterSpacing: '0.1em', color: '#000000', margin: 0, fontFamily: '"Inter", sans-serif' }}>Observation Summary</h4>
@@ -320,6 +322,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
   const [drag, setDrag] = useState<{ from: number; dy: number; target: number; step: number } | null>(null);
   const dragRef = useRef<{ startY: number; rects: DOMRect[] } | null>(null);
   const itemRefs = useRef<(HTMLDivElement | null)[]>([]);
+  const [missingPhotoPrompt, setMissingPhotoPrompt] = useState<{ count: number; run: () => void } | null>(null);
   const [audioBlob, setAudioBlob] = useState<Blob | null>(null);
   const [pendingShareFile, setPendingShareFile] = useState<File | null>(null);
   const [isRecording, setIsRecording] = useState(false);
@@ -633,10 +636,19 @@ function MainApp({ onReset }: { onReset: () => void }) {
     return false;
   };
 
+  // An item needs a photo, some text, or a dictation. Photos can be added later.
+  const hasEntryContent = currentImages.length > 0 || !!manualObservation.trim() || !!manualActionResponsibility.trim() || !!audioBlob;
+
+  // Before exporting, remind about items still waiting for a photo.
+  const withPhotoCheck = (run: () => void) => {
+    const count = entries.filter(e => e.images.length === 0).length;
+    if (count > 0) setMissingPhotoPrompt({ count, run });
+    else run();
+  };
+
   const handleAddOrUpdateEntry = async () => {
-    if (isRecording) stopRecording();
-    if (currentImages.length === 0) {
-      setError("Please capture at least one photo.");
+    if (!hasEntryContent) {
+      setError("Add a photo, an observation, an action or a dictation first.");
       return;
     }
 
@@ -1116,7 +1128,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
                           Preview Report
                         </button>
                         <button
-                          onClick={() => { handleDownload(); setShowMenu(false); }}
+                          onClick={() => { setShowMenu(false); withPhotoCheck(handleDownload); }}
                           disabled={isExporting}
                           className="w-full flex items-center gap-3 px-4 py-3 text-sm font-bold hover:bg-stone-50 rounded-xl transition-colors disabled:opacity-50"
                         >
@@ -1124,7 +1136,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
                           Download PDF
                         </button>
                         <button
-                          onClick={() => { handleShare(); setShowMenu(false); }}
+                          onClick={() => { setShowMenu(false); withPhotoCheck(handleShare); }}
                           disabled={isExporting}
                           className="w-full flex items-center gap-3 px-4 py-3 text-sm font-bold hover:bg-stone-50 rounded-xl transition-colors"
                         >
@@ -1262,7 +1274,14 @@ function MainApp({ onReset }: { onReset: () => void }) {
                   <GripVertical className="w-5 h-5" />
                 </button>
                 <div className="w-24 h-24 rounded-xl overflow-hidden flex-shrink-0 bg-stone-100 relative shadow-sm">
-                  <img src={entry.images[0]} alt="Site" className="w-full h-full object-cover" draggable={false} />
+                  {entry.images.length > 0 ? (
+                    <img src={entry.images[0]} alt="Site" className="w-full h-full object-cover" draggable={false} />
+                  ) : (
+                    <div className="w-full h-full flex flex-col items-center justify-center gap-1 border-2 border-dashed border-stone-300 rounded-xl text-stone-400">
+                      <Image className="w-6 h-6" />
+                      <span className="text-[9px] font-bold uppercase">No photo</span>
+                    </div>
+                  )}
                   {entry.images.length > 1 && (
                     <div className="absolute bottom-1 right-1 bg-black/60 text-white text-[8px] font-bold px-1.5 py-0.5 rounded-md">
                       +{entry.images.length - 1}
@@ -1270,7 +1289,12 @@ function MainApp({ onReset }: { onReset: () => void }) {
                   )}
                 </div>
                 <div className="flex-1 min-w-0 space-y-1 pr-8">
-                  <span className="block text-[10px] font-black tracking-widest text-clark-medium">ITEM {index + 1}</span>
+                  <span className="flex items-center gap-2 text-[10px] font-black tracking-widest text-clark-medium">
+                    ITEM {index + 1}
+                    {entry.images.length === 0 && (
+                      <span className="bg-amber-100 text-amber-800 px-2 py-0.5 rounded-full tracking-tight uppercase">Needs photo</span>
+                    )}
+                  </span>
                   <p className="text-sm font-bold text-clark-navy line-clamp-2">
                     {entry.pendingAI && <span className="inline-flex items-center gap-1 bg-amber-100 text-amber-800 text-[10px] px-2 py-0.5 rounded-full mr-2 uppercase tracking-tight"><AlertCircle className="w-3 h-3" /> Pending AI</span>}
                     {entry.observation}
@@ -1423,7 +1447,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
 
                 <button
                   onClick={handleAddOrUpdateEntry}
-                  disabled={isLoading || currentImages.length === 0}
+                  disabled={isLoading || isRecording || !hasEntryContent}
                   className="w-full bg-clark-navy text-white py-4 rounded-xl font-bold flex items-center justify-center gap-3 disabled:opacity-30 shadow-lg active:scale-[0.98] transition-transform"
                 >
                   {isLoading ? <Loader2 className="w-5 h-5 animate-spin" /> : <Plus className="w-5 h-5" />}
@@ -1467,7 +1491,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
                 </div>
                 <div className="p-4 border-t flex gap-4 bg-white">
                   <button 
-                    onClick={handleDownload}
+                    onClick={() => withPhotoCheck(handleDownload)}
                     disabled={isExporting}
                     className="flex-1 bg-clark-navy text-white py-3 rounded-xl font-bold flex items-center justify-center gap-2 shadow-lg active:scale-95 transition-all disabled:opacity-50"
                   >
@@ -1475,7 +1499,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
                     Download PDF
                   </button>
                   <button 
-                    onClick={handleShare}
+                    onClick={() => withPhotoCheck(handleShare)}
                     disabled={isExporting}
                     className="flex-1 bg-clark-bright text-white py-3 rounded-xl font-bold flex items-center justify-center gap-2 shadow-lg active:scale-95 transition-all disabled:opacity-50"
                   >
@@ -1569,6 +1593,44 @@ function MainApp({ onReset }: { onReset: () => void }) {
           onDone={(shapes) => saveMarkup(markingPhoto, shapes)}
         />
       )}
+
+      {/* Reminder before exporting a report with items that have no photo */}
+      <AnimatePresence>
+        {missingPhotoPrompt && (
+          <div className="fixed inset-0 z-[250] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 no-print">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.9 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.9 }}
+              className="bg-white w-full max-w-sm rounded-3xl overflow-hidden flex flex-col p-6 text-center space-y-6"
+            >
+              <div className="w-16 h-16 bg-amber-100 text-amber-700 rounded-full flex items-center justify-center mx-auto">
+                <Image className="w-8 h-8" />
+              </div>
+              <div>
+                <h3 className="text-xl font-black text-clark-navy mb-2">Missing photos</h3>
+                <p className="text-sm text-stone-500 font-medium">
+                  {missingPhotoPrompt.count === 1 ? '1 item has' : `${missingPhotoPrompt.count} items have`} no photo yet.
+                </p>
+              </div>
+              <div className="flex flex-col gap-3">
+                <button
+                  onClick={() => { const { run } = missingPhotoPrompt; setMissingPhotoPrompt(null); run(); }}
+                  className="w-full bg-clark-navy text-white py-3 rounded-xl font-bold active:scale-95 transition-all"
+                >
+                  Export Anyway
+                </button>
+                <button
+                  onClick={() => { setMissingPhotoPrompt(null); setShowPreview(false); }}
+                  className="w-full bg-stone-100 text-stone-700 py-3 rounded-xl font-bold active:scale-95 transition-all"
+                >
+                  Go Back and Add Photos
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
 
       {/* Post-Share Prompt Modal */}
       <AnimatePresence>
