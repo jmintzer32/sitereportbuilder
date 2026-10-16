@@ -112,6 +112,44 @@ async function analyzeEntry(images: string[], audio: string, audioMimeType: stri
   }
 }
 
+// Same stylesheet that src/index.css imports.
+const FONT_CSS_URL = 'https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=Libre+Baskerville:ital,wght@0,400;0,700;1,400&display=swap';
+let fontCssPromise: Promise<string> | null = null;
+const REPORT_FONTS = [
+  '400 15px "Libre Baskerville"', 'italic 400 11px "Libre Baskerville"',
+  '400 11px "Inter"', '600 11px "Inter"', '700 11px "Inter"', '800 11px "Inter"', '900 11px "Inter"',
+];
+
+// The PDF capture copies the report into a frame that loads stylesheets from the
+// network, so with no signal it loses the fonts. This builds the font CSS with the
+// font files inlined (read via the offline cache when there's no signal) to hand to that frame.
+function embeddedFontCss(): Promise<string> {
+  if (!fontCssPromise) {
+    fontCssPromise = (async () => {
+      try {
+        let css = await (await fetch(FONT_CSS_URL)).text();
+        const urls = Array.from(new Set(css.match(/https:\/\/fonts\.gstatic\.com\/[^)'"\s]+/g) || []));
+        await Promise.all(urls.map(async (url) => {
+          const blob = await (await fetch(url)).blob();
+          const dataUrl = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result as string);
+            reader.onerror = () => reject(reader.error);
+            reader.readAsDataURL(blob);
+          });
+          css = css.split(url).join(dataUrl);
+        }));
+        return css;
+      } catch (err) {
+        console.warn("Could not embed fonts for the PDF", err);
+        fontCssPromise = null; // try again next time
+        return '';
+      }
+    })();
+  }
+  return fontCssPromise;
+}
+
 const ReportContent = ({ currentTemplate, projectInfo, entries }: { currentTemplate: TemplateConfig, projectInfo: ProjectInfo | null, entries: Entry[] }) => (
   <div style={{ 
     backgroundColor: '#ffffff', 
@@ -810,6 +848,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
 
     // Make sure photos and fonts are ready before measuring/capturing
     await document.fonts?.ready;
+    const fontCss = await embeddedFontCss();
     await Promise.all(Array.from<HTMLImageElement>(root.querySelectorAll<HTMLImageElement>('img')).map(img =>
       img.complete ? Promise.resolve() : new Promise(res => { img.onload = img.onerror = () => res(null); })
     ));
@@ -873,7 +912,14 @@ function MainApp({ onReset }: { onReset: () => void }) {
         height: sliceHeight,
         scrollX: 0,
         scrollY: 0,
-        onclone: (clonedDoc) => {
+        onclone: async (clonedDoc) => {
+          if (fontCss) {
+            const style = clonedDoc.createElement('style');
+            style.textContent = fontCss;
+            clonedDoc.head.appendChild(style);
+            // html2canvas measures text right after this, so wait for the fonts to be ready
+            await Promise.all(REPORT_FONTS.map(f => clonedDoc.fonts?.load(f).catch(() => null)));
+          }
           const el = clonedDoc.getElementById('report-capture-root');
           if (!el) return;
           el.style.visibility = 'visible';
