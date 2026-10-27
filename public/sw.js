@@ -1,7 +1,7 @@
 // Keeps a copy of the app on the phone so it opens with no signal.
 // Load the app once with signal; after that it starts from this cache.
 // Bump CACHE when this file changes so old copies are cleared.
-const CACHE = 'site-report-v1';
+const CACHE = 'site-report-v2';
 const NETWORK_TIMEOUT_MS = 4000;
 const CORE = ['/', '/index.html', '/manifest.json', '/icon-192.png', '/icon-512.png'];
 

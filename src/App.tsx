@@ -15,6 +15,8 @@ import { PhotoMarkup, Shape, renderMarkup } from './markup';
 
 interface Entry {
   id: string;
+  /** Optional name shown next to the item number, e.g. "Window head sealant" */
+  title?: string;
   /** Photos as shown in the report (with any markup drawn in) */
   images: string[];
   /** Per photo: the original and its markup, so markup stays editable. null = no markup. */
@@ -26,6 +28,24 @@ interface Entry {
   audioMimeType?: string;
   pendingAI?: boolean;
 }
+
+/** Optional block of report info shown at the top of the PDF when `include` is on. */
+interface ReportDetails {
+  include: boolean;
+  weather: string;
+  parties: string;
+  intro: string;
+  notes: string;
+}
+
+const EMPTY_DETAILS: ReportDetails = { include: false, weather: '', parties: '', intro: '', notes: '' };
+
+const DETAIL_FIELDS: { key: Exclude<keyof ReportDetails, 'include'>; label: string; placeholder: string; multiline: boolean }[] = [
+  { key: 'weather', label: 'Weather', placeholder: 'e.g. Sunny, 62°F, light wind', multiline: false },
+  { key: 'parties', label: 'Parties Present', placeholder: 'e.g. J. Smith (Clark), A. Lee (ABC Glazing)', multiline: true },
+  { key: 'intro', label: 'Purpose / Introduction', placeholder: 'e.g. Weekly enclosure walk of Levels 2–4, east elevation.', multiline: true },
+  { key: 'notes', label: 'General Notes', placeholder: 'Anything that applies to the whole visit', multiline: true },
+];
 
 interface ProjectInfo {
   name: string;
@@ -150,7 +170,163 @@ function embeddedFontCss(): Promise<string> {
   return fontCssPromise;
 }
 
-const ReportContent = ({ currentTemplate, projectInfo, entries }: { currentTemplate: TemplateConfig, projectInfo: ProjectInfo | null, entries: Entry[] }) => (
+// ----- Report photo layout -----
+// Photos keep their real shape: sizes are computed from each photo's width/height
+// ratio (html2canvas ignores object-fit, so cropping in CSS would stretch them).
+const photoRatios = new Map<string, number>();
+const ratioListeners = new Set<() => void>();
+const DEFAULT_RATIO = 4 / 3;
+const ratioKey = (src: string) => src.length + ':' + src.slice(-32);
+
+function loadPhotoRatio(src: string): Promise<void> {
+  const key = ratioKey(src);
+  if (photoRatios.has(key)) return Promise.resolve();
+  return new Promise(resolve => {
+    const img = new window.Image(); // `Image` here is the lucide icon
+    img.onload = () => { photoRatios.set(key, img.naturalWidth / img.naturalHeight || DEFAULT_RATIO); resolve(); };
+    img.onerror = () => { photoRatios.set(key, DEFAULT_RATIO); resolve(); };
+    img.src = src;
+  });
+}
+
+async function ensurePhotoRatios(srcs: string[]) {
+  const missing = srcs.filter(s => !photoRatios.has(ratioKey(s)));
+  if (missing.length === 0) return;
+  await Promise.all(missing.map(loadPhotoRatio));
+  ratioListeners.forEach(l => l());
+}
+
+function usePhotoRatios(srcs: string[]) {
+  const [, rerender] = useState(0);
+  const key = srcs.map(ratioKey).join('|');
+  useEffect(() => {
+    const listener = () => rerender(n => n + 1);
+    ratioListeners.add(listener);
+    ensurePhotoRatios(srcs);
+    return () => { ratioListeners.delete(listener); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key]);
+  return (src: string) => photoRatios.get(ratioKey(src)) ?? DEFAULT_RATIO;
+}
+
+const REPORT_CONTENT_WIDTH = 714; // 794px page minus 40px padding each side
+const PHOTO_GAP = 10;
+const PHOTO_BORDER = 2;
+const LONG_TEXT = 900; // characters of observation + action
+
+interface PlacedPhoto { src: string; index: number; w: number; h: number; }
+interface ItemLayout { mode: 'text' | 'side' | 'stacked'; columnWidth: number; rows: PlacedPhoto[][]; }
+
+// Lays photos out in rows that fill `width`, keeping each photo's shape and giving
+// every photo in a row the same height. Rows hold up to `maxPerRow` photos and
+// stop growing once they'd get shorter than `targetHeight`.
+function justifiedRows(photos: { src: string; index: number; ratio: number }[], width: number, maxPerRow: number, targetHeight: number, maxHeight: number): PlacedPhoto[][] {
+  const rows: PlacedPhoto[][] = [];
+  let i = 0;
+  while (i < photos.length) {
+    let row = [photos[i]];
+    const heightFor = (r: typeof row) => (width - PHOTO_GAP * (r.length - 1) - 2 * PHOTO_BORDER * r.length) / r.reduce((sum, p) => sum + p.ratio, 0);
+    while (i + row.length < photos.length && row.length < maxPerRow && heightFor([...row, photos[i + row.length]]) >= targetHeight) {
+      row = [...row, photos[i + row.length]];
+    }
+    const h = Math.min(heightFor(row), maxHeight);
+    rows.push(row.map(p => ({ src: p.src, index: p.index, w: Math.floor(p.ratio * h), h: Math.floor(h) })));
+    i += row.length;
+  }
+  return rows;
+}
+
+// Picks a layout from the number of photos, their shapes and the amount of text:
+// - no photos: text across the full width
+// - 1-2 photos: photos beside the text (unless the text is long and there are 2)
+// - 3+ photos: text across the top, photos in rows underneath
+function planItemLayout(images: string[], textLength: number, ratioOf: (src: string) => number): ItemLayout {
+  const photos = images.map((src, index) => ({ src, index, ratio: ratioOf(src) }));
+  const n = photos.length;
+  if (n === 0) return { mode: 'text', columnWidth: 0, rows: [] };
+
+  const allPortrait = photos.every(p => p.ratio < 0.9);
+  if (n === 1 || (n === 2 && textLength <= LONG_TEXT)) {
+    if (n === 1) {
+      const columnWidth = photos[0].ratio < 0.9 ? 210 : 300;
+      return { mode: 'side', columnWidth, rows: justifiedRows(photos, columnWidth, 1, 0, 300) };
+    }
+    // Two photos: side by side if either is portrait, otherwise stacked in a column
+    if (allPortrait || photos.some(p => p.ratio < 0.9)) {
+      return { mode: 'side', columnWidth: 320, rows: justifiedRows(photos, 320, 2, 0, 260) };
+    }
+    return { mode: 'side', columnWidth: 260, rows: justifiedRows(photos, 260, 1, 0, 260) };
+  }
+  return { mode: 'stacked', columnWidth: REPORT_CONTENT_WIDTH, rows: justifiedRows(photos, REPORT_CONTENT_WIDTH, 3, 190, 260) };
+}
+
+const reportPhoto = (photo: PlacedPhoto) => (
+  <img
+    key={photo.index}
+    src={photo.src}
+    alt={`Photo ${photo.index + 1}`}
+    style={{ display: 'block', width: `${photo.w}px`, height: `${photo.h}px`, border: `${PHOTO_BORDER}px solid #0066B3`, borderRadius: '4px', flexShrink: 0 }}
+  />
+);
+
+const ItemText = ({ entry, stackColumns }: { entry: Entry; stackColumns: boolean }) => (
+  <div style={{ flex: 1, minWidth: 0, display: 'grid', gridTemplateColumns: stackColumns ? '1fr' : '1fr 1fr', gap: stackColumns ? '18px' : '30px' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+      <h4 style={{ fontSize: '10px', fontWeight: '900', textTransform: 'uppercase', letterSpacing: '0.1em', color: '#000000', margin: 0, fontFamily: '"Inter", sans-serif' }}>Observation Summary</h4>
+      <p style={{ fontSize: '15px', lineHeight: '1.6', fontWeight: '400', color: '#001430', margin: 0, whiteSpace: 'pre-wrap', fontFamily: '"Libre Baskerville", serif' }}>{entry.observation}</p>
+      {entry.transcription && (
+        <div style={{ marginTop: '15px', paddingTop: '15px', borderTop: '1px solid #00A9E0' }}>
+          <h4 style={{ fontSize: '9px', fontWeight: '900', textTransform: 'uppercase', letterSpacing: '0.1em', color: '#000000', margin: 0, fontFamily: '"Inter", sans-serif' }}>Voice Note Transcription</h4>
+          <p style={{ fontSize: '11px', fontStyle: 'italic', color: '#0066B3', margin: 0, whiteSpace: 'pre-wrap', fontFamily: '"Libre Baskerville", serif' }}>{entry.transcription}</p>
+        </div>
+      )}
+    </div>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+      <h4 style={{ fontSize: '10px', fontWeight: '900', textTransform: 'uppercase', letterSpacing: '0.1em', color: '#000000', margin: 0, fontFamily: '"Inter", sans-serif' }}>Action & Responsibility</h4>
+      <p style={{ fontSize: '14px', lineHeight: '1.5', fontWeight: '800', color: '#001430', margin: 0, whiteSpace: 'pre-wrap', fontFamily: '"Inter", sans-serif' }}>{entry.actionResponsibility}</p>
+    </div>
+  </div>
+);
+
+const ReportItemBody = ({ entry }: { entry: Entry }) => {
+  const ratioOf = usePhotoRatios(entry.images);
+  const textLength = (entry.observation || '').length + (entry.actionResponsibility || '').length + (entry.transcription || '').length;
+  const layout = planItemLayout(entry.images, textLength, ratioOf);
+
+  if (layout.mode === 'text') return <ItemText entry={entry} stackColumns={false} />;
+
+  if (layout.mode === 'side') {
+    const textWidth = REPORT_CONTENT_WIDTH - layout.columnWidth - 30;
+    return (
+      <div style={{ display: 'flex', gap: '30px', alignItems: 'flex-start' }}>
+        <div style={{ width: `${layout.columnWidth}px`, flexShrink: 0, display: 'flex', flexDirection: 'column', gap: `${PHOTO_GAP}px` }}>
+          {layout.rows.map((row, r) => (
+            // The first row stays with the "ITEM n" label; later rows may start a new page.
+            <div key={r} data-pdf-break={r > 0 ? '' : undefined} data-pdf-keep="" style={{ display: 'flex', gap: `${PHOTO_GAP}px` }}>
+              {row.map(reportPhoto)}
+            </div>
+          ))}
+        </div>
+        <ItemText entry={entry} stackColumns={textWidth < 400} />
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+      <ItemText entry={entry} stackColumns={false} />
+      <div style={{ display: 'flex', flexDirection: 'column', gap: `${PHOTO_GAP}px` }}>
+        {layout.rows.map((row, r) => (
+          <div key={r} data-pdf-break="" data-pdf-keep="" style={{ display: 'flex', gap: `${PHOTO_GAP}px` }}>
+            {row.map(reportPhoto)}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+const ReportContent = ({ currentTemplate, projectInfo, entries, details }: { currentTemplate: TemplateConfig, projectInfo: ProjectInfo | null, entries: Entry[], details: ReportDetails }) => (
   <div style={{ 
     backgroundColor: '#ffffff', 
     width: '100%', 
@@ -190,6 +366,17 @@ const ReportContent = ({ currentTemplate, projectInfo, entries }: { currentTempl
       gap: '40px',
       flex: 1
     }}>
+      {/* Optional report details (weather, parties present, ...) */}
+      {details.include && DETAIL_FIELDS.some(f => details[f.key].trim()) && (
+        <div data-pdf-break="" style={{ borderTop: `3px solid ${currentTemplate.hexColor}`, paddingTop: '16px', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '18px 30px' }}>
+          {DETAIL_FIELDS.filter(f => details[f.key].trim()).map(f => (
+            <div key={f.key} data-pdf-keep="" style={{ gridColumn: f.key === 'weather' || f.key === 'parties' ? 'auto' : '1 / -1' }}>
+              <h4 style={{ fontSize: '10px', fontWeight: '900', textTransform: 'uppercase', letterSpacing: '0.1em', color: '#000000', margin: '0 0 6px', fontFamily: '"Inter", sans-serif' }}>{f.label}</h4>
+              <p style={{ fontSize: '13px', lineHeight: '1.6', color: '#001430', margin: 0, whiteSpace: 'pre-wrap', fontFamily: '"Libre Baskerville", serif' }}>{details[f.key].trim()}</p>
+            </div>
+          ))}
+        </div>
+      )}
       {entries.map((entry, index) => (
         <div 
           key={entry.id} 
@@ -214,50 +401,14 @@ const ReportContent = ({ currentTemplate, projectInfo, entries }: { currentTempl
             >
               ITEM {index + 1}
             </span>
+            {entry.title?.trim() && (
+              <span style={{ marginLeft: '10px', fontSize: '14px', fontWeight: '800', color: '#0066B3', fontFamily: '"Inter", sans-serif' }}>
+                {entry.title.trim()}
+              </span>
+            )}
           </div>
           
-          <div style={{ display: 'flex', gap: '30px' }}>
-            {entry.images.length > 0 && (
-            <div style={{ width: '240px', display: 'flex', flexDirection: 'column', gap: '10px', flexShrink: 0 }}>
-              {entry.images.map((img, i) => (
-                <div 
-                  key={i} 
-                  // The first photo stays with its "ITEM n" label; later photos may start a new page.
-                  data-pdf-break={i > 0 ? '' : undefined}
-                  data-pdf-keep=""
-                  style={{ 
-                    width: '100%',
-                    aspectRatio: '4/3', 
-                    borderRadius: '4px', 
-                    overflow: 'hidden', 
-                    border: '2px solid #0066B3',
-                    breakInside: 'avoid'
-                  }}
-                >
-                  <img src={img} alt="Site" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
-                </div>
-              ))}
-            </div>
-            )}
-            <div style={{ flex: 1, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '30px' }}>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                <h4 style={{ fontSize: '10px', fontWeight: '900', textTransform: 'uppercase', letterSpacing: '0.1em', color: '#000000', margin: 0, fontFamily: '"Inter", sans-serif' }}>Observation Summary</h4>
-                <p style={{ fontSize: '15px', lineHeight: '1.6', fontWeight: '400', color: '#001430', margin: 0, fontFamily: '"Libre Baskerville", serif' }}>{entry.observation}</p>
-                {entry.transcription && (
-                  <div style={{ marginTop: '15px', paddingTop: '15px', borderTop: '1px solid #00A9E0' }}>
-                    <h4 style={{ fontSize: '9px', fontWeight: '900', textTransform: 'uppercase', letterSpacing: '0.1em', color: '#000000', margin: 0, fontFamily: '"Inter", sans-serif' }}>Voice Note Transcription</h4>
-                    <p style={{ fontSize: '11px', fontStyle: 'italic', color: '#0066B3', margin: 0, fontFamily: '"Libre Baskerville", serif' }}>{entry.transcription}</p>
-                  </div>
-                )}
-              </div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '24px' }}>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                  <h4 style={{ fontSize: '10px', fontWeight: '900', textTransform: 'uppercase', letterSpacing: '0.1em', color: '#000000', margin: 0, fontFamily: '"Inter", sans-serif' }}>Action & Responsibility</h4>
-                  <p style={{ fontSize: '14px', fontWeight: '800', color: '#001430', margin: 0, fontFamily: '"Inter", sans-serif' }}>{entry.actionResponsibility}</p>
-                </div>
-              </div>
-            </div>
-          </div>
+          <ReportItemBody entry={entry} />
         </div>
       ))}
 
@@ -304,6 +455,8 @@ function MainApp({ onReset }: { onReset: () => void }) {
   const [entries, setEntries] = useState<Entry[]>([]);
   const [projectInfo, setProjectInfo] = useState<ProjectInfo | null>(null);
   const [isSettingUp, setIsSettingUp] = useState(true);
+  const [selectedTemplate, setSelectedTemplate] = useState<TemplateType>('QUICK');
+  const [details, setDetails] = useState<ReportDetails>(EMPTY_DETAILS);
   const [error, setError] = useState<string | null>(null);
   
   // Temporary state for the setup form
@@ -318,6 +471,12 @@ function MainApp({ onReset }: { onReset: () => void }) {
       try {
         const savedEntries = await get('constructReport_entries');
         if (savedEntries) setEntries(savedEntries);
+
+        const savedTemplate = await get('constructReport_template');
+        if (TEMPLATES.some(t => t.id === savedTemplate)) setSelectedTemplate(savedTemplate);
+
+        const savedDetails = await get('constructReport_details');
+        if (savedDetails) setDetails({ ...EMPTY_DETAILS, ...savedDetails });
 
         const savedProjectInfo = await get('constructReport_projectInfo');
         if (savedProjectInfo) {
@@ -353,6 +512,18 @@ function MainApp({ onReset }: { onReset: () => void }) {
     }
   }, [projectInfo, isInitializing]);
 
+  useEffect(() => {
+    if (!isInitializing) {
+      set('constructReport_template', selectedTemplate).catch(err => console.error("Failed to save template", err));
+    }
+  }, [selectedTemplate, isInitializing]);
+
+  useEffect(() => {
+    if (!isInitializing) {
+      set('constructReport_details', details).catch(err => console.error("Failed to save report details", err));
+    }
+  }, [details, isInitializing]);
+
   const [currentImages, setCurrentImages] = useState<string[]>([]);
   const [currentMarkups, setCurrentMarkups] = useState<(PhotoMarkup | null)[]>([]);
   const [viewingPhoto, setViewingPhoto] = useState<number | null>(null);
@@ -365,7 +536,6 @@ function MainApp({ onReset }: { onReset: () => void }) {
   const [pendingShareFile, setPendingShareFile] = useState<File | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
-  const [selectedTemplate, setSelectedTemplate] = useState<TemplateType>('QUICK');
   const [isExporting, setIsExporting] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [showCapture, setShowCapture] = useState(true);
@@ -398,6 +568,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
   // Form fields for manual entry/edit
   const [manualObservation, setManualObservation] = useState('');
   const [manualActionResponsibility, setManualActionResponsibility] = useState('');
+  const [manualTitle, setManualTitle] = useState('');
   const [liveTranscription, setLiveTranscription] = useState('');
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -470,6 +641,20 @@ function MainApp({ onReset }: { onReset: () => void }) {
   const removeCurrentImage = (index: number) => {
     setCurrentImages(prev => prev.filter((_, i) => i !== index));
     setCurrentMarkups(prev => prev.filter((_, i) => i !== index));
+  };
+
+  // Moves a photo within the item; the first photo is the one shown in the list.
+  const movePhoto = (from: number, to: number) => {
+    if (to < 0 || to >= currentImages.length) return;
+    const move = <T,>(arr: T[]) => {
+      const next = [...arr];
+      const [item] = next.splice(from, 1);
+      next.splice(to, 0, item);
+      return next;
+    };
+    setCurrentImages(move);
+    setCurrentMarkups(move);
+    setViewingPhoto(to);
   };
 
   const saveMarkup = async (index: number, shapes: Shape[]) => {
@@ -675,7 +860,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
   };
 
   // An item needs a photo, some text, or a dictation. Photos can be added later.
-  const hasEntryContent = currentImages.length > 0 || !!manualObservation.trim() || !!manualActionResponsibility.trim() || !!audioBlob;
+  const hasEntryContent = currentImages.length > 0 || !!manualTitle.trim() || !!manualObservation.trim() || !!manualActionResponsibility.trim() || !!audioBlob;
 
   // Before exporting, remind about items still waiting for a photo.
   const withPhotoCheck = (run: () => void) => {
@@ -739,6 +924,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
 
       const newEntry: Entry = {
         id: editingId || Date.now().toString(),
+        title: manualTitle.trim() || undefined,
         images: currentImages,
         markups: currentMarkups.some(Boolean) ? currentMarkups : undefined,
         observation: observation || manualObservation,
@@ -775,6 +961,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
     setLiveTranscription('');
     setManualObservation('');
     setManualActionResponsibility('');
+    setManualTitle('');
     setEditingId(null);
     setError(null);
   };
@@ -791,6 +978,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
     setCurrentMarkups(entry.markups ?? entry.images.map(() => null));
     setManualObservation(entry.observation);
     setManualActionResponsibility(entry.actionResponsibility);
+    setManualTitle(entry.title || '');
     setShowCapture(true);
   };
 
@@ -849,6 +1037,9 @@ function MainApp({ onReset }: { onReset: () => void }) {
     // Make sure photos and fonts are ready before measuring/capturing
     await document.fonts?.ready;
     const fontCss = await embeddedFontCss();
+    // Photo shapes decide the layout; load any missing ones and let the report re-render.
+    await ensurePhotoRatios(entries.flatMap(e => e.images));
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(null))));
     await Promise.all(Array.from<HTMLImageElement>(root.querySelectorAll<HTMLImageElement>('img')).map(img =>
       img.complete ? Promise.resolve() : new Promise(res => { img.onload = img.onerror = () => res(null); })
     ));
@@ -875,7 +1066,8 @@ function MainApp({ onReset }: { onReset: () => void }) {
       .filter(isCleanBreak)
       .sort((a, b) => a - b);
     const endEl = root.querySelector('[data-pdf-end]');
-    const contentEnd = endEl ? measure(endEl).bottom : root.scrollHeight;
+    // A little room below the footer so its last line is never clipped
+    const contentEnd = Math.min(endEl ? measure(endEl).bottom + 24 : root.scrollHeight, root.scrollHeight);
 
     const slices: { start: number; end: number }[] = [];
     let start = 0;
@@ -900,7 +1092,8 @@ function MainApp({ onReset }: { onReset: () => void }) {
 
     for (let i = 0; i < slices.length; i++) {
       const { start: sliceStart, end: sliceEnd } = slices[i];
-      const sliceHeight = Math.ceil(sliceEnd - sliceStart);
+      // Round down so the slice never includes a pixel of whatever starts the next page
+      const sliceHeight = Math.max(1, Math.floor(sliceEnd - sliceStart));
 
       // Capture one page at a time; this keeps each canvas small enough for mobile Safari.
       const canvas = await html2canvas(root, {
@@ -1048,6 +1241,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
       // Clear IndexedDB explicitly
       await del('constructReport_entries');
       await del('constructReport_projectInfo');
+      await set('constructReport_details', { ...EMPTY_DETAILS, include: details.include });
       
       // Reset the application state completely by remounting
       onReset();
@@ -1259,6 +1453,54 @@ function MainApp({ onReset }: { onReset: () => void }) {
           </div>
         </section>
 
+        {/* Report details: optional info for the top of the report */}
+        <section className="bg-white p-4 rounded-2xl shadow-sm border border-stone-200 space-y-3">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <label htmlFor="details-toggle" className="text-[10px] uppercase tracking-widest font-bold text-stone-400 block">Report Details</label>
+              <p className="text-xs text-stone-500 mt-0.5">Weather, parties present and intro for the top of the report.</p>
+            </div>
+            <button
+              id="details-toggle"
+              type="button"
+              role="switch"
+              aria-checked={details.include}
+              aria-label="Include report details on the report"
+              onClick={() => setDetails(d => ({ ...d, include: !d.include }))}
+              className={`relative w-12 h-7 flex-shrink-0 rounded-full transition-colors ${details.include ? 'bg-clark-bright' : 'bg-stone-300'}`}
+            >
+              <span className={`absolute top-1 left-1 w-5 h-5 rounded-full bg-white shadow transition-transform ${details.include ? 'translate-x-5' : ''}`} />
+            </button>
+          </div>
+          {details.include && (
+            <div className="space-y-3">
+              {DETAIL_FIELDS.map(f => (
+                <div key={f.key} className="space-y-1">
+                  <label htmlFor={`detail-${f.key}`} className="text-[10px] uppercase tracking-widest font-bold text-stone-400">{f.label}</label>
+                  {f.multiline ? (
+                    <textarea
+                      id={`detail-${f.key}`}
+                      value={details[f.key]}
+                      onChange={(e) => setDetails(d => ({ ...d, [f.key]: e.target.value }))}
+                      placeholder={f.placeholder}
+                      className="w-full bg-stone-50 border border-stone-200 rounded-xl p-3 text-sm focus:ring-2 focus:ring-clark-bright outline-none min-h-[64px]"
+                    />
+                  ) : (
+                    <input
+                      id={`detail-${f.key}`}
+                      value={details[f.key]}
+                      onChange={(e) => setDetails(d => ({ ...d, [f.key]: e.target.value }))}
+                      placeholder={f.placeholder}
+                      className="w-full bg-stone-50 border border-stone-200 rounded-xl p-3 text-sm focus:ring-2 focus:ring-clark-bright outline-none"
+                    />
+                  )}
+                </div>
+              ))}
+              <p className="text-[10px] text-stone-400">Leave a field blank to leave it off. Turn the switch off to hide this section from the report; what you typed is kept.</p>
+            </div>
+          )}
+        </section>
+
         {/* Entries List */}
         <section className="space-y-4">
           <div className="flex items-center justify-between px-2">
@@ -1341,7 +1583,10 @@ function MainApp({ onReset }: { onReset: () => void }) {
                       <span className="bg-amber-100 text-amber-800 px-2 py-0.5 rounded-full tracking-tight uppercase">Needs photo</span>
                     )}
                   </span>
-                  <p className="text-sm font-bold text-clark-navy line-clamp-2">
+                  {entry.title?.trim() && (
+                    <p className="text-sm font-black text-clark-navy line-clamp-2 break-words">{entry.title.trim()}</p>
+                  )}
+                  <p className={`text-sm text-clark-navy line-clamp-2 ${entry.title?.trim() ? 'font-medium' : 'font-bold'}`}>
                     {entry.pendingAI && <span className="inline-flex items-center gap-1 bg-amber-100 text-amber-800 text-[10px] px-2 py-0.5 rounded-full mr-2 uppercase tracking-tight"><AlertCircle className="w-3 h-3" /> Pending AI</span>}
                     {entry.observation}
                   </p>
@@ -1472,6 +1717,16 @@ function MainApp({ onReset }: { onReset: () => void }) {
                 {/* Manual Fields */}
                 <div className="space-y-4">
                   <div className="space-y-1">
+                    <label className="text-[10px] uppercase tracking-widest font-bold text-stone-400">Item Name <span className="normal-case tracking-normal font-medium">(optional)</span></label>
+                    <input 
+                      value={manualTitle}
+                      onChange={(e) => setManualTitle(e.target.value)}
+                      placeholder="e.g. Window head sealant, Level 3"
+                      maxLength={80}
+                      className="w-full bg-stone-50 border border-stone-200 rounded-xl p-3 text-sm focus:ring-2 focus:ring-clark-bright outline-none"
+                    />
+                  </div>
+                  <div className="space-y-1">
                     <label className="text-[10px] uppercase tracking-widest font-bold text-stone-400">Observation</label>
                     <textarea 
                       value={manualObservation}
@@ -1482,11 +1737,11 @@ function MainApp({ onReset }: { onReset: () => void }) {
                   </div>
                   <div className="space-y-1">
                     <label className="text-[10px] uppercase tracking-widest font-bold text-stone-400">Action & Responsibility</label>
-                    <input 
+                    <textarea 
                       value={manualActionResponsibility}
                       onChange={(e) => setManualActionResponsibility(e.target.value)}
                       placeholder="Required fix and responsible trade..."
-                      className="w-full bg-stone-50 border border-stone-200 rounded-xl p-3 text-sm focus:ring-2 focus:ring-clark-bright outline-none"
+                      className="w-full bg-stone-50 border border-stone-200 rounded-xl p-3 text-sm focus:ring-2 focus:ring-clark-bright outline-none min-h-[80px]"
                     />
                   </div>
                 </div>
@@ -1532,6 +1787,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
                       currentTemplate={currentTemplate}
                       projectInfo={projectInfo}
                       entries={entries}
+                      details={details}
                     />
                   </div>
                 </div>
@@ -1581,6 +1837,7 @@ function MainApp({ onReset }: { onReset: () => void }) {
           currentTemplate={currentTemplate}
           projectInfo={projectInfo}
           entries={entries}
+          details={details}
         />
       </div>
 
@@ -1609,6 +1866,19 @@ function MainApp({ onReset }: { onReset: () => void }) {
               </button>
             )}
           </div>
+          {currentImages.length > 1 && (
+            <div className="flex items-center justify-between gap-2 px-3 pt-3 bg-stone-900 text-xs font-bold">
+              <button type="button" onClick={() => movePhoto(viewingPhoto, viewingPhoto - 1)} disabled={viewingPhoto === 0}
+                className="flex items-center gap-1 px-3 py-2 rounded-lg bg-stone-800 disabled:opacity-30">
+                <ChevronLeft className="w-4 h-4" /> Move earlier
+              </button>
+              <span className="text-stone-400 font-medium text-center">{viewingPhoto === 0 ? 'Shown first' : `Position ${viewingPhoto + 1}`}</span>
+              <button type="button" onClick={() => movePhoto(viewingPhoto, viewingPhoto + 1)} disabled={viewingPhoto === currentImages.length - 1}
+                className="flex items-center gap-1 px-3 py-2 rounded-lg bg-stone-800 disabled:opacity-30">
+                Move later <ChevronRight className="w-4 h-4" />
+              </button>
+            </div>
+          )}
           <div className="grid grid-cols-3 gap-2 p-3 bg-stone-900" style={{ paddingBottom: 'max(0.75rem, env(safe-area-inset-bottom))' }}>
             <button type="button" onClick={() => setMarkingPhoto(viewingPhoto)}
               className="flex flex-col items-center gap-1 py-2 rounded-xl bg-stone-800 text-xs font-bold">
