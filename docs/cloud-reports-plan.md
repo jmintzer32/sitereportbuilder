@@ -107,6 +107,24 @@ Efficiency notes:
   (batches of ~20). Saves unmarked photos: full-size (2560 px) when signed in,
   the phone's copy when signed out.
 
+## Invites and email
+
+- Sharing works before the person has an account: access is stored by email, and the
+  report appears under **Shared with me** once they sign up with that email and verify
+  it. The share list shows them as "Invited, no account yet".
+- Firebase sends only sign-in emails (verify, password reset), from
+  `noreply@<project>.firebaseapp.com`; sender name and wording are editable.
+- First version: no email service. After sharing, a **Send invite** button opens the
+  phone's share sheet with a ready-written message (report name, app link, "sign up
+  with this email"), sent from the person's own email or Teams.
+- Later, automatic invites and update notices (daily summary, can be turned off) need
+  a sending service:
+  1. A Clark mailbox (e.g. `sitereports@clarkconstruction.com`) via Microsoft 365.
+     Best delivery to Clark inboxes; needs Clark IT approval.
+  2. An email service (SendGrid, Mailgun, Postmark) with a domain we control. May be
+     tagged external or quarantined until Clark IT trusts it.
+  Sent from the existing Cloud Run server.
+
 ## Admin: managing users and data
 
 **At launch: Firebase console** (console.firebase.google.com), no extra build:
