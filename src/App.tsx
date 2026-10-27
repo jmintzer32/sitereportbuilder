@@ -170,6 +170,162 @@ function embeddedFontCss(): Promise<string> {
   return fontCssPromise;
 }
 
+// ----- Report photo layout -----
+// Photos keep their real shape: sizes are computed from each photo's width/height
+// ratio (html2canvas ignores object-fit, so cropping in CSS would stretch them).
+const photoRatios = new Map<string, number>();
+const ratioListeners = new Set<() => void>();
+const DEFAULT_RATIO = 4 / 3;
+const ratioKey = (src: string) => src.length + ':' + src.slice(-32);
+
+function loadPhotoRatio(src: string): Promise<void> {
+  const key = ratioKey(src);
+  if (photoRatios.has(key)) return Promise.resolve();
+  return new Promise(resolve => {
+    const img = new window.Image(); // `Image` here is the lucide icon
+    img.onload = () => { photoRatios.set(key, img.naturalWidth / img.naturalHeight || DEFAULT_RATIO); resolve(); };
+    img.onerror = () => { photoRatios.set(key, DEFAULT_RATIO); resolve(); };
+    img.src = src;
+  });
+}
+
+async function ensurePhotoRatios(srcs: string[]) {
+  const missing = srcs.filter(s => !photoRatios.has(ratioKey(s)));
+  if (missing.length === 0) return;
+  await Promise.all(missing.map(loadPhotoRatio));
+  ratioListeners.forEach(l => l());
+}
+
+function usePhotoRatios(srcs: string[]) {
+  const [, rerender] = useState(0);
+  const key = srcs.map(ratioKey).join('|');
+  useEffect(() => {
+    const listener = () => rerender(n => n + 1);
+    ratioListeners.add(listener);
+    ensurePhotoRatios(srcs);
+    return () => { ratioListeners.delete(listener); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key]);
+  return (src: string) => photoRatios.get(ratioKey(src)) ?? DEFAULT_RATIO;
+}
+
+const REPORT_CONTENT_WIDTH = 714; // 794px page minus 40px padding each side
+const PHOTO_GAP = 10;
+const PHOTO_BORDER = 2;
+const LONG_TEXT = 900; // characters of observation + action
+
+interface PlacedPhoto { src: string; index: number; w: number; h: number; }
+interface ItemLayout { mode: 'text' | 'side' | 'stacked'; columnWidth: number; rows: PlacedPhoto[][]; }
+
+// Lays photos out in rows that fill `width`, keeping each photo's shape and giving
+// every photo in a row the same height. Rows hold up to `maxPerRow` photos and
+// stop growing once they'd get shorter than `targetHeight`.
+function justifiedRows(photos: { src: string; index: number; ratio: number }[], width: number, maxPerRow: number, targetHeight: number, maxHeight: number): PlacedPhoto[][] {
+  const rows: PlacedPhoto[][] = [];
+  let i = 0;
+  while (i < photos.length) {
+    let row = [photos[i]];
+    const heightFor = (r: typeof row) => (width - PHOTO_GAP * (r.length - 1) - 2 * PHOTO_BORDER * r.length) / r.reduce((sum, p) => sum + p.ratio, 0);
+    while (i + row.length < photos.length && row.length < maxPerRow && heightFor([...row, photos[i + row.length]]) >= targetHeight) {
+      row = [...row, photos[i + row.length]];
+    }
+    const h = Math.min(heightFor(row), maxHeight);
+    rows.push(row.map(p => ({ src: p.src, index: p.index, w: Math.floor(p.ratio * h), h: Math.floor(h) })));
+    i += row.length;
+  }
+  return rows;
+}
+
+// Picks a layout from the number of photos, their shapes and the amount of text:
+// - no photos: text across the full width
+// - 1-2 photos: photos beside the text (unless the text is long and there are 2)
+// - 3+ photos: text across the top, photos in rows underneath
+function planItemLayout(images: string[], textLength: number, ratioOf: (src: string) => number): ItemLayout {
+  const photos = images.map((src, index) => ({ src, index, ratio: ratioOf(src) }));
+  const n = photos.length;
+  if (n === 0) return { mode: 'text', columnWidth: 0, rows: [] };
+
+  const allPortrait = photos.every(p => p.ratio < 0.9);
+  if (n === 1 || (n === 2 && textLength <= LONG_TEXT)) {
+    if (n === 1) {
+      const columnWidth = photos[0].ratio < 0.9 ? 210 : 300;
+      return { mode: 'side', columnWidth, rows: justifiedRows(photos, columnWidth, 1, 0, 300) };
+    }
+    // Two photos: side by side if either is portrait, otherwise stacked in a column
+    if (allPortrait || photos.some(p => p.ratio < 0.9)) {
+      return { mode: 'side', columnWidth: 320, rows: justifiedRows(photos, 320, 2, 0, 260) };
+    }
+    return { mode: 'side', columnWidth: 260, rows: justifiedRows(photos, 260, 1, 0, 260) };
+  }
+  return { mode: 'stacked', columnWidth: REPORT_CONTENT_WIDTH, rows: justifiedRows(photos, REPORT_CONTENT_WIDTH, 3, 190, 260) };
+}
+
+const reportPhoto = (photo: PlacedPhoto) => (
+  <img
+    key={photo.index}
+    src={photo.src}
+    alt={`Photo ${photo.index + 1}`}
+    style={{ display: 'block', width: `${photo.w}px`, height: `${photo.h}px`, border: `${PHOTO_BORDER}px solid #0066B3`, borderRadius: '4px', flexShrink: 0 }}
+  />
+);
+
+const ItemText = ({ entry, stackColumns }: { entry: Entry; stackColumns: boolean }) => (
+  <div style={{ flex: 1, minWidth: 0, display: 'grid', gridTemplateColumns: stackColumns ? '1fr' : '1fr 1fr', gap: stackColumns ? '18px' : '30px' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+      <h4 style={{ fontSize: '10px', fontWeight: '900', textTransform: 'uppercase', letterSpacing: '0.1em', color: '#000000', margin: 0, fontFamily: '"Inter", sans-serif' }}>Observation Summary</h4>
+      <p style={{ fontSize: '15px', lineHeight: '1.6', fontWeight: '400', color: '#001430', margin: 0, whiteSpace: 'pre-wrap', fontFamily: '"Libre Baskerville", serif' }}>{entry.observation}</p>
+      {entry.transcription && (
+        <div style={{ marginTop: '15px', paddingTop: '15px', borderTop: '1px solid #00A9E0' }}>
+          <h4 style={{ fontSize: '9px', fontWeight: '900', textTransform: 'uppercase', letterSpacing: '0.1em', color: '#000000', margin: 0, fontFamily: '"Inter", sans-serif' }}>Voice Note Transcription</h4>
+          <p style={{ fontSize: '11px', fontStyle: 'italic', color: '#0066B3', margin: 0, whiteSpace: 'pre-wrap', fontFamily: '"Libre Baskerville", serif' }}>{entry.transcription}</p>
+        </div>
+      )}
+    </div>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+      <h4 style={{ fontSize: '10px', fontWeight: '900', textTransform: 'uppercase', letterSpacing: '0.1em', color: '#000000', margin: 0, fontFamily: '"Inter", sans-serif' }}>Action & Responsibility</h4>
+      <p style={{ fontSize: '14px', lineHeight: '1.5', fontWeight: '800', color: '#001430', margin: 0, whiteSpace: 'pre-wrap', fontFamily: '"Inter", sans-serif' }}>{entry.actionResponsibility}</p>
+    </div>
+  </div>
+);
+
+const ReportItemBody = ({ entry }: { entry: Entry }) => {
+  const ratioOf = usePhotoRatios(entry.images);
+  const textLength = (entry.observation || '').length + (entry.actionResponsibility || '').length + (entry.transcription || '').length;
+  const layout = planItemLayout(entry.images, textLength, ratioOf);
+
+  if (layout.mode === 'text') return <ItemText entry={entry} stackColumns={false} />;
+
+  if (layout.mode === 'side') {
+    const textWidth = REPORT_CONTENT_WIDTH - layout.columnWidth - 30;
+    return (
+      <div style={{ display: 'flex', gap: '30px', alignItems: 'flex-start' }}>
+        <div style={{ width: `${layout.columnWidth}px`, flexShrink: 0, display: 'flex', flexDirection: 'column', gap: `${PHOTO_GAP}px` }}>
+          {layout.rows.map((row, r) => (
+            // The first row stays with the "ITEM n" label; later rows may start a new page.
+            <div key={r} data-pdf-break={r > 0 ? '' : undefined} data-pdf-keep="" style={{ display: 'flex', gap: `${PHOTO_GAP}px` }}>
+              {row.map(reportPhoto)}
+            </div>
+          ))}
+        </div>
+        <ItemText entry={entry} stackColumns={textWidth < 400} />
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+      <ItemText entry={entry} stackColumns={false} />
+      <div style={{ display: 'flex', flexDirection: 'column', gap: `${PHOTO_GAP}px` }}>
+        {layout.rows.map((row, r) => (
+          <div key={r} data-pdf-break="" data-pdf-keep="" style={{ display: 'flex', gap: `${PHOTO_GAP}px` }}>
+            {row.map(reportPhoto)}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
 const ReportContent = ({ currentTemplate, projectInfo, entries, details }: { currentTemplate: TemplateConfig, projectInfo: ProjectInfo | null, entries: Entry[], details: ReportDetails }) => (
   <div style={{ 
     backgroundColor: '#ffffff', 
@@ -252,48 +408,7 @@ const ReportContent = ({ currentTemplate, projectInfo, entries, details }: { cur
             )}
           </div>
           
-          <div style={{ display: 'flex', gap: '30px' }}>
-            {entry.images.length > 0 && (
-            <div style={{ width: '240px', display: 'flex', flexDirection: 'column', gap: '10px', flexShrink: 0 }}>
-              {entry.images.map((img, i) => (
-                <div 
-                  key={i} 
-                  // The first photo stays with its "ITEM n" label; later photos may start a new page.
-                  data-pdf-break={i > 0 ? '' : undefined}
-                  data-pdf-keep=""
-                  style={{ 
-                    width: '100%',
-                    aspectRatio: '4/3', 
-                    borderRadius: '4px', 
-                    overflow: 'hidden', 
-                    border: '2px solid #0066B3',
-                    breakInside: 'avoid'
-                  }}
-                >
-                  <img src={img} alt="Site" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
-                </div>
-              ))}
-            </div>
-            )}
-            <div style={{ flex: 1, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '30px' }}>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                <h4 style={{ fontSize: '10px', fontWeight: '900', textTransform: 'uppercase', letterSpacing: '0.1em', color: '#000000', margin: 0, fontFamily: '"Inter", sans-serif' }}>Observation Summary</h4>
-                <p style={{ fontSize: '15px', lineHeight: '1.6', fontWeight: '400', color: '#001430', margin: 0, whiteSpace: 'pre-wrap', fontFamily: '"Libre Baskerville", serif' }}>{entry.observation}</p>
-                {entry.transcription && (
-                  <div style={{ marginTop: '15px', paddingTop: '15px', borderTop: '1px solid #00A9E0' }}>
-                    <h4 style={{ fontSize: '9px', fontWeight: '900', textTransform: 'uppercase', letterSpacing: '0.1em', color: '#000000', margin: 0, fontFamily: '"Inter", sans-serif' }}>Voice Note Transcription</h4>
-                    <p style={{ fontSize: '11px', fontStyle: 'italic', color: '#0066B3', margin: 0, fontFamily: '"Libre Baskerville", serif' }}>{entry.transcription}</p>
-                  </div>
-                )}
-              </div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '24px' }}>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                  <h4 style={{ fontSize: '10px', fontWeight: '900', textTransform: 'uppercase', letterSpacing: '0.1em', color: '#000000', margin: 0, fontFamily: '"Inter", sans-serif' }}>Action & Responsibility</h4>
-                  <p style={{ fontSize: '14px', fontWeight: '800', color: '#001430', margin: 0, whiteSpace: 'pre-wrap', fontFamily: '"Inter", sans-serif' }}>{entry.actionResponsibility}</p>
-                </div>
-              </div>
-            </div>
-          </div>
+          <ReportItemBody entry={entry} />
         </div>
       ))}
 
@@ -922,6 +1037,9 @@ function MainApp({ onReset }: { onReset: () => void }) {
     // Make sure photos and fonts are ready before measuring/capturing
     await document.fonts?.ready;
     const fontCss = await embeddedFontCss();
+    // Photo shapes decide the layout; load any missing ones and let the report re-render.
+    await ensurePhotoRatios(entries.flatMap(e => e.images));
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(null))));
     await Promise.all(Array.from<HTMLImageElement>(root.querySelectorAll<HTMLImageElement>('img')).map(img =>
       img.complete ? Promise.resolve() : new Promise(res => { img.onload = img.onerror = () => res(null); })
     ));
@@ -948,7 +1066,8 @@ function MainApp({ onReset }: { onReset: () => void }) {
       .filter(isCleanBreak)
       .sort((a, b) => a - b);
     const endEl = root.querySelector('[data-pdf-end]');
-    const contentEnd = endEl ? measure(endEl).bottom : root.scrollHeight;
+    // A little room below the footer so its last line is never clipped
+    const contentEnd = Math.min(endEl ? measure(endEl).bottom + 24 : root.scrollHeight, root.scrollHeight);
 
     const slices: { start: number; end: number }[] = [];
     let start = 0;
@@ -973,7 +1092,8 @@ function MainApp({ onReset }: { onReset: () => void }) {
 
     for (let i = 0; i < slices.length; i++) {
       const { start: sliceStart, end: sliceEnd } = slices[i];
-      const sliceHeight = Math.ceil(sliceEnd - sliceStart);
+      // Round down so the slice never includes a pixel of whatever starts the next page
+      const sliceHeight = Math.max(1, Math.floor(sliceEnd - sliceStart));
 
       // Capture one page at a time; this keeps each canvas small enough for mobile Safari.
       const canvas = await html2canvas(root, {
