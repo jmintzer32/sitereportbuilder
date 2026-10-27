@@ -30,6 +30,15 @@ Mockup: https://claude.ai/artifact/5SLhnS7HkHcmnxBqBhu8Jy
   thumbnail for lists. Not full camera resolution.
 - Save all photos saves the unmarked full-size photos.
 
+## Any device
+
+Signed in, the same reports open and can be edited on a phone or a computer
+(any modern browser, at the same app link). Changes made on one show up on the
+other within a couple of seconds. On a computer, photos come from files instead of
+the camera, and dictation works with the computer's microphone in Chrome or Edge.
+The layout stays phone-width on a computer in the first version; a wider desktop
+layout could come later.
+
 ## Services (same Google Cloud project as Cloud Run)
 
 | Need | Service |
@@ -97,6 +106,57 @@ Efficiency notes:
 - **Save all photos**: report menu and item screen, one share sheet for all photos
   (batches of ~20). Saves unmarked photos: full-size (2560 px) when signed in,
   the phone's copy when signed out.
+
+## Admin: managing users and data
+
+**At launch: Firebase console** (console.firebase.google.com), no extra build:
+- Authentication > Users: every account, created date, last sign-in;
+  disable, delete, or send a password reset.
+- Firestore Database > Data: browse and fix any report, item or share list.
+- Storage: browse photos by report and see space used.
+- Usage and billing: sign-ins, reads/writes, storage, cost.
+- Google Cloud console: billing, budget alerts, backups, IAM (who else is an admin).
+
+A one-page admin guide will cover: disabling someone, seeing who a report is shared
+with, restoring from a backup, and checking costs.
+
+**Built into the cloud version:**
+- Admins list (owner's email to start). Rules let admins read and fix every report.
+- 30-day trash for deleted reports, so one tap can't permanently delete a shared report.
+- Only owners (and admins) can delete or re-share a report.
+
+**Owner to set up in the console:**
+- Firestore scheduled backups (e.g. daily, kept a few weeks).
+- Keep Cloud Storage soft delete on (default), so deleted photos can be recovered briefly.
+- Budget alert.
+- A backup admin in IAM; read-only people get the Firebase Viewer role.
+
+**Later, if useful: in-app Admin page** (admins only), with privileged actions run
+through the existing Cloud Run server:
+- People: accounts, last sign-in, reports owned, Disable.
+- Reports: owner, share list, items/photos, last update; search by project.
+- Offboarding: disable an account and transfer its reports in one step.
+- Fix access on any report; storage totals and largest reports.
+
+**Policies to decide:**
+- People who leave Clark: disable the account and pick who takes over their reports.
+  The Clark-email limit only blocks new sign-ups, not existing accounts.
+- Retention, e.g. archive reports after 2 years.
+- Privacy: tell users that app admins can see every report; check Clark's rules on
+  where project photos may be stored.
+
+## AI dictation (Gemini) — decision needed
+
+"Dictate to AI" sends the recording to Google's Gemini (server.ts, `/api/analyze`,
+key from the `gemini-api-key` secret) to write the Observation and
+Action & Responsibility. The phone's own speech-to-text runs alongside it and
+fills in when Gemini isn't available.
+
+Options:
+1. Keep Gemini, and cap its usage in Google Cloud so a bug or misuse can't run up a bill.
+2. Remove Gemini: dictation uses only the phone's built-in speech-to-text, typed
+   straight into Observation (no automatic clean-up or Action extraction). No key,
+   no AI cost, recordings never leave the phone.
 
 ## Rolling back
 
