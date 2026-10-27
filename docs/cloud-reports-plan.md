@@ -163,18 +163,14 @@ through the existing Cloud Run server:
 - Privacy: tell users that app admins can see every report; check Clark's rules on
   where project photos may be stored.
 
-## AI dictation (Gemini) — decision needed
+## AI dictation (Gemini)
 
-"Dictate to AI" sends the recording to Google's Gemini (server.ts, `/api/analyze`,
-key from the `gemini-api-key` secret) to write the Observation and
-Action & Responsibility. The phone's own speech-to-text runs alongside it and
-fills in when Gemini isn't available.
-
-Options:
-1. Keep Gemini, and cap its usage in Google Cloud so a bug or misuse can't run up a bill.
-2. Remove Gemini: dictation uses only the phone's built-in speech-to-text, typed
-   straight into Observation (no automatic clean-up or Action extraction). No key,
-   no AI cost, recordings never leave the phone.
+Decision: keep Gemini as is. "Dictate to AI" sends the recording to Gemini
+(server.ts, `/api/analyze`, key from the `gemini-api-key` secret) to write the
+Observation and Action & Responsibility; the phone's speech-to-text fills in when
+Gemini isn't available. Owner to add a usage cap on the key in Google Cloud.
+(Claude was considered but its API doesn't take audio, so it couldn't replace the
+transcription step on its own.)
 
 ## Rolling back
 
